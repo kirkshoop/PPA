@@ -18,12 +18,14 @@ const float em_center_um = em_center_mm * 1000.0f;                       // a co
 
 const float max_pulse_dist_mm = 
   beam_center_mm + beam2em_dist_mm + em_center_mm;                       // all pulses will be relative to this max distance
-const float max_pulse_dist_um = 
-  beam_center_um + beam2em_dist_um + em_center_um;                       // all pulses will be relative to this max distance
+const float max_pulse_dist_um = max_pulse_dist_mm * 1000.0f;             // all pulses will be relative to this max distance
 
-const int em_max_safe_clicks = 60000;
-
-const int clicks_per_us = 2;                                             // with an Arduino Uno, use 2 processor clicks per microsecond
+const float clockHz = 16000000.0f;
+const int timer_prescaler = 8;
+const int timer_prescaler_mask = (0 << CS12) | (1 << CS11) | (0 << CS10);
+const float clicks_per_second = clockHz / timer_prescaler;
+const float clicks_per_us = clicks_per_second / 1000000.0f;              // eg. with an Arduino Uno (16Mhz clk/8), use 2 processor clicks per microsecond
+const unsigned long em_max_safe_clicks = 65536;                          // 16bit clock
 //*********************************************************************
 
 
@@ -41,7 +43,11 @@ Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
 #include "PID_v2.h"
 // Specify the links and initial tuning parameters
 //double Kp = 4, Ki = 0.2, Kd = 0.1;
-double Kp = (max_pulse_dist_um * 0.80f), Ki = 0.20f, Kd = 0.10f;
+const float max_pid_em_output_um = max_pulse_dist_um * 0.5f;
+const float min_pid_em_output_um = 800.0f;
+// Ziegler–Nichols method for tuning PID
+double Ku = (max_pid_em_output_um * 0.50f) - min_pid_em_output_um, Tu = 2.00f; 
+double Kp = (Ku * 0.60f), Ki = 1.2f * Ku / Tu, Kd = 3.0f * Ku * Tu / 40.00f;
 PID_v2 ppaPID(Kp, Ki, Kd, PID::Direct);
 //*********************************************************************
 
@@ -56,12 +62,12 @@ const int high_no_switch = 852 + cv;
 double updateThrottle(const int pin) {
   float throttle = analogRead(pin);
   if (throttle < low_no_switch) {
-    return 2.0f;
+    return 1.50f;
   } else if (throttle > high_no_switch) {
-    return 4.0f;
+    return 8.0f;
   } else {
-    // map from throttle position to 2.00m/s - 4.00m/s
-    return map(throttle, low_no_switch, high_no_switch, 200, 400) / 100.0;
+    // map from throttle position to 1.50m/s - 8.00m/s
+    return map(throttle, low_no_switch, high_no_switch, 150, 800) / 100.0;
   }
 }
 
@@ -153,6 +159,11 @@ class IRPS
     }
 
   public:
+    static int readIrpsAddress() {
+      auto irps_port = portInputRegister(digitalPinToPort(ir_add0));
+      static const uint8_t irps_bitmask = digitalPinToBitMask(ir_add0) | digitalPinToBitMask(ir_add1) | digitalPinToBitMask(ir_add2);
+      return (~*irps_port & irps_bitmask) >> 3;
+    }
 
     void reset() {
       irps_status_ = IRPSStatus::Ready;
@@ -161,7 +172,7 @@ class IRPS
     }
 
     void set_pulse_dist_mm(int pulse_mm) {
-      pulse_dist_mm_ = pulse_mm;
+      pulse_dist_mm_ = min(pulse_mm, max_dist_mm_);
     }
     
     IRPSStatus get_status() {
@@ -209,6 +220,7 @@ class IRPS
         const float delta_clicks_ = delta_time_us_ * clicks_per_us;   //convert microseconds to clicks
         const float clicks_mm_ = delta_clicks_ / interbeam_dist_mm_;  //convert clicks to clicks per mm
 
+
         // reset when irps measurment invalid
         if (delta_time_us_ < 0.0f) {
           reset();
@@ -225,24 +237,26 @@ class IRPS
 
         //  if the electromagnet is enabled for pulsing, calculate required timing
         if (enabled_) {
-          pulse_clicks_ = clicks_mm_ * pulse_dist_mm_;                  // pulse_clicks is number of clicks of EM pulse duration
-          wait_clicks_ = clicks_mm_ * (max_dist_mm_ - pulse_dist_mm_);  // wait_clicks is number of clicks before starting EM pulse
+          pulse_clicks_ = clicks_mm_ * pulse_dist_mm_;                   // pulse_clicks is number of clicks of EM pulse duration
+          wait_clicks_ = clicks_mm_ * (max_dist_mm_ - pulse_dist_mm_) * 0.96f;   // wait_clicks is number of clicks before starting EM pulse
         }
 
         String report;          // hold data for printing
         if (send_to_print_stack_ == true) {
           //     the following calculation could be moved out of interrupt time
-//          float speed_ = interbeam_dist_um / (float) delta_time_;   //calculate speed as float for reporting
-//          report = String(irps_number_) + "," + String(speed_, 2);
+//          float speed_ = (float)interbeam_dist_mm / (delta_time_us_ / 1000.0f);   //calculate speed as float for reporting
+//          report = String(irps_number_) + ", " + String(speed_, 2);
         }
 
         ir_event temp = {irps_number_ , em_number_, wait_clicks_, pulse_clicks_, report, irps_status_};
         return temp;
       }
 
-      // reset due to invalid state
+      // reset
       String report;          // hold data for printing
-      if (send_to_print_stack_ == true) {
+      if (send_to_print_stack_ == true && irps_number_ == irps_number) {
+        // only report invalid events that are targeted to this irps - other 
+        // events are valid resets for this irps
         report = "b" + String(irps_number) + "," + String(int(irps_status_));
       }
       reset();
@@ -258,9 +272,9 @@ class IRPS
 //note: array below allows for Super size, but will also work for Standard PPA
 IRPS irps[] = {
   IRPS(0, 7, false, interbeam_dist_mm, max_pulse_dist_mm, false),
-  IRPS(1, 0, true, interbeam_dist_mm, max_pulse_dist_mm, false),
-  IRPS(2, 2, true, interbeam_dist_mm, max_pulse_dist_mm, false),
-  IRPS(3, 1, true, interbeam_dist_mm, max_pulse_dist_mm, false),
+  IRPS(1, 0, true, interbeam_dist_mm, max_pulse_dist_mm, true),
+  IRPS(2, 2, true, interbeam_dist_mm, max_pulse_dist_mm, true),
+  IRPS(3, 1, true, interbeam_dist_mm, max_pulse_dist_mm, true),
   IRPS(4, 4, true, interbeam_dist_mm, max_pulse_dist_mm, false),
   IRPS(5, 5, true, interbeam_dist_mm, max_pulse_dist_mm, false),
   IRPS(6, 3, true, interbeam_dist_mm, max_pulse_dist_mm, false)
@@ -299,6 +313,18 @@ class EM
       safetime_ = safetime;
     }
 
+  public:
+
+    static int readEmAddress() {
+      auto em_port = portInputRegister(digitalPinToPort(out_add0));
+      static const uint8_t em_bitmask = digitalPinToBitMask(out_add0) | digitalPinToBitMask(out_add1) | digitalPinToBitMask(out_add2);
+      auto result = *em_port;
+      // reverse bottom four bits
+      result = ((result & B00001100) >> 2) | ((result & B00000011) << 2);
+      result = ((result & B00001010) >> 1) | ((result & B00000101) << 1);
+      return result >> 1; // remove fourth bit to leave the three bit address
+    }
+
     void reset() {
       digitalWrite(out_flag, EM_DISABLE);   // disable EM
       noInterrupts();                       // disable all interrupts
@@ -333,20 +359,48 @@ class EM
       digitalWrite(out_add1, em_number_ & 2);
       digitalWrite(out_add2, em_number_ & 4);
 
-      //    Set up interrupt to wait for right time to start the pulse
+      if (fire.wait_duration > 0) {
+        //    Set up interrupt to wait for right time to start the pulse
+        set_status(EMStatus::Pending);          // Set EM is in waiting period 
+        startTimer(fire.wait_duration);
+  
+      } else {
+        startPulse();
+      }
+    }
 
+    void startTimer(unsigned long clicks) {
       noInterrupts();                         // disable all interrupts while interrupt parameters are changing
       TCCR1A = 0;                             // reset all bits
       TCCR1B = 0;                             // reset all bits
-      OCR1A = fire.wait_duration;             // input is already in clicks, in theory should subtract 1
+      OCR1A = clicks;                         // input is already in clicks, in theory should subtract 1
       TCCR1B |= (1 << WGM12);                 // CTC mode
-      TCCR1B |= (1 << CS11);                  // 8 prescaler.  On a 16MHz Arduino, a prescaler of 8 gives a 0.5usecond click
+      TCCR1B |= timer_prescaler_mask;         // On a 16MHz Arduino, a prescaler of 64 gives a 4usecond click
       TIFR1 |= (1 << OCF1A);                  // clear
 
       TIMSK1 |= (1 << OCIE1A);                // enable timer compare interrupt
       TCNT1 = 0;                              // set counter to 0
-      status_ = EMStatus::Pending;            // Set EM is in waiting period 
       interrupts();                           // enable all interrupts
+    }
+
+    void stopTimer() {
+      noInterrupts();                       // disable all interrupts
+      TIMSK1 &= ~(1 << OCIE1A);             // disable future interrupts ie. CTC interrupt to give a 'one-shot' effect
+      interrupts();                         // enable all interrupts
+    }
+
+    void startPulse() {
+//    digitalWrite(scope0_toggle, HIGH);    // display wait period end on scope
+
+      digitalWrite(out_flag, EM_ACTIVE);    // enable the EM
+      set_status(EMStatus::On);             // Set EM is now energised
+      startTimer(get_pulse_clicks());
+    }
+
+    void stopPulse() {
+      digitalWrite(out_flag, EM_DISABLE);   // disable EM
+      set_status(EMStatus::Off);            // clear status to show EM is off
+      stopTimer();
     }
 
 };    //end of EM class
@@ -374,37 +428,16 @@ static class EM& active_em() {
 
 ISR(TIMER1_COMPA_vect) // timer compare interrupt service routine
 {
-  auto& em_ = active_em();
+  auto& em_ = em[EM::readEmAddress()];
 
   //for end of pulse, send disable output quickly
   if (em_.get_status() == EMStatus::On) {
-    digitalWrite(out_flag, EM_DISABLE);   // disable EM
-    noInterrupts();                       // disable all interrupts
-    TIMSK1 &= ~(1 << OCIE1A);             // disable future interrupts ie. CTC interrupt to give a 'one-shot' effect
-    em_.set_status(EMStatus::Off);        // clear status to show EM is off
-    interrupts();                         // enable all interrupts
+    em_.stopPulse();
   }
 
   //for start of pulse, send activate output
   else if (em_.get_status() == EMStatus::Pending) {
-//    digitalWrite(scope0_toggle, HIGH);    // display wait period start on scope
-
-    const auto actual_pulse = active_em().get_pulse_clicks();
-
-    digitalWrite(out_flag, EM_ACTIVE);    // enable the EM
-
-    noInterrupts();                       // disable all interrupts
-    TCCR1A = 0;                           // reset all bits
-    TCCR1B = 0;                           // reset all bits
-    OCR1A = actual_pulse;                 // input is already in clicks, in theory should subtract 1
-    TCCR1B |= (1 << WGM12);               // CTC mode
-    TCCR1B |= (1 << CS11);                // 8 prescaler.  On a 16MHz Arduino, a prescaler of 8 gives a 0.5usecond click
-    TIFR1 |= (1 << OCF1A);                // clear
-
-    TIMSK1 |= (1 << OCIE1A);              // enable timer compare interrupt
-    TCNT1 = 0;                            // set counter to 0
-    em_.set_status(EMStatus::On);         // Set EM is now energised
-    interrupts();                         // enable all interrupts
+    em_.startPulse();
   }
 }
 
@@ -430,7 +463,7 @@ void setup() {
 //  digitalWrite(scope0_toggle, LOW);       // initialise with turned off value
   digitalWrite(out_flag, EM_DISABLE);       // initialise with turned off value
 
-  ppaPID.SetOutputLimits(1, max_pulse_dist_um); // PID is used to modulate how long the pulse is in micrometers
+  ppaPID.SetOutputLimits(min_pid_em_output_um, max_pid_em_output_um); // PID is used to modulate how long the pulse is in micrometers
   ppaPID.Start(0.0f, 0.0f, updateThrottle(thr));       // 
 
   //SCREEN
@@ -515,7 +548,11 @@ void loop() {
 
       irps_.set_pulse_dist_mm(output_mm);
 
-      const auto yPos = map(speed * 100, 0, 600, tft.height(), 49);  // scale speed according to graph area on scale for plotting purposes
+//      const float delta_clicks_ = delta_time_us * clicks_per_us;   //convert microseconds to clicks
+//      const float clicks_mm_ = delta_clicks_ / interbeam_dist_mm;  //convert clicks to clicks per mm
+
+      const auto yPos = map(speed * 100, 0, 1000, tft.height(), 49);  // scale actual speed (0.0-10.0 m/s) according to graph area on scale for plotting purposes
+      const auto yTargetPos = map(target_speed * 100, 0, 1000, tft.height(), 49);  // scale target speed (0.0-10.0 m/s) according to graph area on scale for plotting purposes
   
       //Manage screen scrolling
       xPos = xPos + 1;
@@ -526,11 +563,18 @@ void loop() {
   
       tft.drawPixel( xPos, yPos, ILI9341_WHITE );
       tft.drawPixel( xPos, yPos - 1, ILI9341_WHITE );
+      tft.drawPixel( xPos, yTargetPos, ILI9341_RED );
 
       tft.setCursor(0, 35);
       tft.print(speed, 2);
       tft.print(" - ");
       tft.print(target_speed, 2);
+      tft.print(" - ");
+      tft.print(output_mm, 2);
+      tft.print("mm ");
+//      tft.print(" - ");
+//      tft.print(clicks_mm_ * output_mm, 2);
+//      tft.print("cl ");
     }
   }
 }   //end of main loop
@@ -538,7 +582,8 @@ void loop() {
 void demuxINT() {
  
   //demultiplexes hardware ir_interrupt and calls relevant Speed Sensor (IRPS) based on address
-  irps_number = (~PIND & B00111000) >> 3;
+
+  irps_number = IRPS::readIrpsAddress();
 
   if (irps_number < 0 || irps_number >= irpsCount) {
     irps_number = 0;
@@ -547,7 +592,7 @@ void demuxINT() {
     return;
   }
 
-  // notify all of interrupt
+  // notify all irps of interrupt
   for (int i = 0; i < irpsCount; i++) {
     //call function to process IR interrupt
     struct ir_event current_event = irps[i].handleStatus(irps_number);
@@ -560,7 +605,7 @@ void demuxINT() {
     // enqueue log output
     int string_length = current_event.print_string.length();
     if (string_length > 2) {
-      for (int i = 0; i <= string_length && !printqueue.isFull(); i++) {
+      for (int i = 0; i <= string_length && !printqueue.isFull(); ++i) {
         printqueue.enqueue(current_event.print_string.charAt(i));
       }
     }
@@ -572,7 +617,7 @@ void display_main() {
   tft.setCursor(0, 0);
   tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
   tft.setTextSize(1);
-  tft.println("~ PPA! ~ PID");
+  tft.println("~ PPA! ~ particle_pid_v1_6EM");
   tft.println("");
   tft.print("Actual - Target (Speeds in m/sec)");
   tft.setTextSize(2);
