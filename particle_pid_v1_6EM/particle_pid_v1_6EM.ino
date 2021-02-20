@@ -497,27 +497,25 @@ void runDisplay(ATimeScheduler scheduler) {
   // update display.
   static const auto first = scheduler.now() + std::chrono::milliseconds(200);
   static auto display_op = unifex::connect(  
-    unifex::interval(first, std::chrono::milliseconds(87)) 
+    unifex::interval(first, std::chrono::milliseconds(57)) 
     | unifex::transform([](auto tick){
 
         auto& irps_ = active_irps();
         auto& em_ = active_em();
 
+        auto tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tick.time_since_epoch());
+
         if (irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
           return;
         }
 
-        const auto xPos_ = map(std::chrono::duration_cast<std::chrono::milliseconds>(tick.time_since_epoch()).count() % 60000, 0, 60000, 0, tft.width());  // scale actual speed according to graph area on scale for plotting purposes
+        const auto xPos_ = map(tick_ms.count() % 60'000, 0, 60'000, 0, tft.width());  // scale actual speed according to graph area on scale for plotting purposes
 
         if (xPos == xPos_) {
+          // only draw once per unique pixel
           return;
         }
         xPos = xPos_;
-    
-        //Manage screen scrolling
-        if (xPos < 2) {
-          tft.fillRect(0, 49, tft.width(), tft.height() - 49, ILI9341_BLACK);
-        }
 
         const float delta_time_us = irps_.get_delta_time_us();
         if (delta_time_us <= 0.0f) {
@@ -528,17 +526,31 @@ void runDisplay(ATimeScheduler scheduler) {
 
         const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
 
-        const auto yPos = map(speed * 100, 0, 1000, tft.height(), 49);  // scale actual speed according to graph area on scale for plotting purposes
-        const auto yTargetPos = map(target_speed * 100, 0, 1000, tft.height(), 49);  // scale target speed according to graph area on scale for plotting purposes
-    
-        tft.drawPixel( xPos, yPos, ILI9341_WHITE );
-        tft.drawPixel( xPos, yPos - 1, ILI9341_WHITE );
+        const auto yPos = map(speed * 100, 0, 1000, tft.height(), 52);  // scale actual speed according to graph area on scale for plotting purposes
+        const auto yTargetPos = map(target_speed * 100, 0, 1000, tft.height(), 52);  // scale target speed according to graph area on scale for plotting purposes
+
+        // clear next line
+        tft.drawFastVLine(xPos, 52, tft.height() - 52, ILI9341_BLACK);
+        tft.drawFastVLine(xPos + 1, 52, tft.height() - 52, ILI9341_BLACK);
+        tft.drawFastVLine(xPos + 2, 52, tft.height() - 52, ILI9341_BLACK);
+
+        // indicator for current position
+        tft.drawFastHLine(0, tft.height() - 2, tft.width(), ILI9341_BLACK);
+        tft.drawFastHLine(0, tft.height() - 1, tft.width(), ILI9341_BLACK);
+        tft.drawFastVLine( xPos, tft.height() - 2, 2, ILI9341_GREEN );
+
+        // actual speed
+        tft.drawFastVLine( xPos, yPos, 2, ILI9341_WHITE );
+
+        // target speed
         tft.drawPixel( xPos, yTargetPos, ILI9341_RED );
   
         tft.setCursor(0, 35);
         tft.print(speed, 2);
         tft.print(" - ");
         tft.print(target_speed, 2);
+        tft.print(" - ");
+        tft.print((long)tick_ms.count());
       }) 
     | unifex::on(scheduler), receiver{});
   static const bool started = (unifex::start(display_op), true);
