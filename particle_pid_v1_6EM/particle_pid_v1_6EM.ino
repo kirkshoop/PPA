@@ -56,7 +56,7 @@ const float max_pulse_dist_mm =
   beam_center_mm + beam2em_dist_mm + em_center_mm;                       // all pulses will be relative to this max distance
 const float max_pulse_dist_um = max_pulse_dist_mm * 1000.0f;             // all pulses will be relative to this max distance
 
-const float min_speed_mps = 1.5f; // slowest speed physically maintainable
+const float min_speed_mps = 1.8f; // slowest speed physically maintainable
 const float max_speed_mps = 8.0f; // highest speed physically attainable
 
 //*********************************************************************
@@ -254,9 +254,9 @@ class IRPS
 
       //    first infrared beam has been broken in a valid state
       if (irps_number == irps_number_ && irps_status_ == IRPSStatus::Ready && s1_ == arduino_clock::time_point{} && s2_ == arduino_clock::time_point{}) {
-        s1_ = arduino_clock::now();         // record beam break time
-        irps_status_ = IRPSStatus::Entered; // update status to show first beam break
-        String report;                      // hold data for printing
+        s1_ = unifex::get_scheduler(timer).now();  // record beam break time
+        irps_status_ = IRPSStatus::Entered;        // update status to show first beam break
+        String report;                             // hold data for printing
         if (send_to_print_stack_ == true) {
 //          report = "<";
         }
@@ -266,11 +266,11 @@ class IRPS
 
       //    second infrared beam has been broken in a valid state
       else if (irps_number == irps_number_ && irps_status_ == IRPSStatus::Entered && s1_ != arduino_clock::time_point{} && s2_ == arduino_clock::time_point{}) {
-        s2_ = arduino_clock::now();          // record beam break time
-        irps_status_ = IRPSStatus::Exited;   // update status to show second beam break
+        s2_ = unifex::get_scheduler(timer).now();  // record beam break time
+        irps_status_ = IRPSStatus::Exited;         // update status to show second beam break
 
-        const auto delta_clicks_ = get_delta_time();             //time between first and second beam breaks
-        const auto clicks_mm_ = delta_clicks_ / interbeam_dist_mm_;  //convert clicks to clicks per mm
+        const auto delta_clicks_ = get_delta_time();                 // time between first and second beam breaks
+        const auto clicks_mm_ = delta_clicks_ / interbeam_dist_mm_;  // convert clicks to clicks per mm
 
 
         // reset when irps measurment invalid
@@ -402,8 +402,8 @@ class EM
       safetime_ = safetime;
     }
 
-    arduino::steady_clock::time_point waitTime_;
-    arduino::steady_clock::time_point pulseTime_;
+    arduino_clock::time_point waitTime_;
+    arduino_clock::time_point pulseTime_;
 
   public:
 
@@ -441,7 +441,7 @@ class EM
       digitalWrite(out_add1, em_number_ & 2);
       digitalWrite(out_add2, em_number_ & 4);
 
-      if (fire.startTime > arduino_clock::now()) {
+      if (fire.startTime > unifex::get_scheduler(timer).now()) {
         stopPulse();
         set_status(EMStatus::Pending);          // Set EM is in waiting period 
         //    Set up timer to wait for right time to start the pulse
@@ -497,28 +497,39 @@ void runDisplay(ATimeScheduler scheduler) {
   // update display.
   static const auto first = scheduler.now() + std::chrono::milliseconds(200);
   static auto display_op = unifex::connect(  
-    unifex::interval(first, std::chrono::milliseconds(250)) 
+    unifex::interval(first, std::chrono::milliseconds(87)) 
     | unifex::transform([](auto tick){
+
         auto& irps_ = active_irps();
         auto& em_ = active_em();
-        const float delta_time_us = irps_.get_delta_time_us();
 
-        if (irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off || delta_time_us < 0.0f) {
+        if (irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
           return;
         }
+
+        const auto xPos_ = map(std::chrono::duration_cast<std::chrono::milliseconds>(tick.time_since_epoch()).count() % 60000, 0, 60000, 0, tft.width());  // scale actual speed according to graph area on scale for plotting purposes
+
+        if (xPos == xPos_) {
+          return;
+        }
+        xPos = xPos_;
+    
+        //Manage screen scrolling
+        if (xPos < 2) {
+          tft.fillRect(0, 49, tft.width(), tft.height() - 49, ILI9341_BLACK);
+        }
+
+        const float delta_time_us = irps_.get_delta_time_us();
+        if (delta_time_us <= 0.0f) {
+          return;
+        }
+
         const double target_speed = ppaPID.GetSetpoint();
 
         const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
 
-        const auto yPos = map(speed * 100, 0, 1000, tft.height(), 49);  // scale actual speed (0.0-10.0 m/s) according to graph area on scale for plotting purposes
-        const auto yTargetPos = map(target_speed * 100, 0, 1000, tft.height(), 49);  // scale target speed (0.0-10.0 m/s) according to graph area on scale for plotting purposes
-    
-        //Manage screen scrolling
-        xPos = xPos + 1;
-        if (xPos > tft.width()) {
-          tft.fillRect(0, 49, tft.width(), tft.height() - 49, ILI9341_BLACK);
-          xPos = 0;
-        }
+        const auto yPos = map(speed * 100, 0, 1000, tft.height(), 49);  // scale actual speed according to graph area on scale for plotting purposes
+        const auto yTargetPos = map(target_speed * 100, 0, 1000, tft.height(), 49);  // scale target speed according to graph area on scale for plotting purposes
     
         tft.drawPixel( xPos, yPos, ILI9341_WHITE );
         tft.drawPixel( xPos, yPos - 1, ILI9341_WHITE );
@@ -598,8 +609,6 @@ void loop() {
 
   static const bool looping = (Serial.println("first loop"), true);
 
-  loop_context.run_once();
-
   auto& irps_ = active_irps();
   auto& em_ = active_em();
 
@@ -607,13 +616,15 @@ void loop() {
     return;
   }
 
+  loop_context.run_once();
+
   // update once after each EM pulse
   if (last_irps_number != irps_.get_irps_number()) {
     last_irps_number = irps_.get_irps_number();
 
     float delta_time_us = irps_.get_delta_time_us();
 
-    if (delta_time_us > 0) {
+    if (delta_time_us > 0.0f) {
       const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
       const double output_mm = ppaPID.Run(speed) / 1000.0f;
 
@@ -633,7 +644,7 @@ void demuxINT() {
     return;
   }
 
-  auto now = arduino_clock::now();
+  auto now = unifex::get_scheduler(timer).now();
 
   // notify all irps of interrupt
   for (int i = 0; i < irpsCount; i++) {
