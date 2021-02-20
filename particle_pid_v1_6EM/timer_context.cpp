@@ -40,6 +40,7 @@ timer_context::~timer_context() {
 
 void timer_context::enqueue(task_base* task) noexcept {
 //   Serial.println('e');
+  noInterrupts();                          // disable all interrupts while interrupt parameters are changing
   if (head_ == nullptr || task->dueTime_ < head_->dueTime_) {
     // Insert at the head of the queue.
     task->next_ = head_;
@@ -56,7 +57,7 @@ void timer_context::enqueue(task_base* task) noexcept {
     // Serial.println(click_count);
 
     // New minimum due-time has changed, set the hardware timer.
-    noInterrupts();                          // disable all interrupts while interrupt parameters are changing
+    // noInterrupts();                          // disable all interrupts while interrupt parameters are changing
     TCCR1A = 0;                              // reset all bits
     TCCR1B = 0;                              // reset all bits
     OCR1A = click_count;                     // input is already in clicks, in theory should subtract 1
@@ -66,7 +67,7 @@ void timer_context::enqueue(task_base* task) noexcept {
 
     TIMSK1 |= (1 << OCIE1A);                 // enable timer compare interrupt
     TCNT1 = 0;                               // set counter to 0
-    interrupts();                            // enable all interrupts
+    // interrupts();                            // enable all interrupts
   } else {
     auto* queuedTask = head_;
     while (queuedTask->next_ != nullptr &&
@@ -82,6 +83,7 @@ void timer_context::enqueue(task_base* task) noexcept {
     }
     queuedTask->next_ = task;
   }
+  interrupts();                            // enable all interrupts
 //   Serial.println("~e");
 }
 
@@ -92,6 +94,7 @@ void timer_context::run() {
 
 //   Serial.println('i');
 
+  noInterrupts();                          // disable all interrupts while interrupt parameters are changing
   while (!stop_ && head_ != nullptr) {
     auto now = clock_t::now();
     auto nextDueTime = head_->dueTime_;
@@ -108,12 +111,14 @@ void timer_context::run() {
       // Flag the task as dequeued.
       task->prevNextPtr_ = nullptr;
 
+      interrupts();                            // enable all interrupts
       task->execute();
+      noInterrupts();                          // disable all interrupts while interrupt parameters are changing
     } else {
       // Not yet ready to run.
       std::uint16_t click_count = std::min(nextDueTime - now, arduino::max_clicks).count();
 
-      noInterrupts();                          // disable all interrupts while interrupt parameters are changing
+    //   noInterrupts();                          // disable all interrupts while interrupt parameters are changing
       TCCR1A = 0;                              // reset all bits
       TCCR1B = 0;                              // reset all bits
       OCR1A = click_count;                     // input is already in clicks, in theory should subtract 1
@@ -123,11 +128,12 @@ void timer_context::run() {
 
       TIMSK1 |= (1 << OCIE1A);                 // enable timer compare interrupt
       TCNT1 = 0;                               // set counter to 0
-      interrupts();                            // enable all interrupts
+    //   interrupts();                            // enable all interrupts
 
       break;
     }
   }
+  interrupts();                            // enable all interrupts
 //   Serial.println("~i");
 }
 
@@ -138,6 +144,8 @@ void _timer_context::cancel_callback::operator()() noexcept {
 
     if (task_->prevNextPtr_ != nullptr) {
       // Task is still in the queue, dequeue and requeue it.
+      
+      noInterrupts();                          // disable all interrupts while interrupt parameters are changing
 
       // Remove from the queue.
       *task_->prevNextPtr_ = task_->next_;
@@ -148,6 +156,8 @@ void _timer_context::cancel_callback::operator()() noexcept {
 
       // And requeue with an updated time.
       task_->dueTime_ = now;
+      interrupts();                            // enable all interrupts
+
       task_->context_->enqueue(task_);
     }
   }
