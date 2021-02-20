@@ -39,6 +39,7 @@ timer_context::~timer_context() {
 }
 
 void timer_context::enqueue(task_base* task) noexcept {
+//   Serial.println('e');
   if (head_ == nullptr || task->dueTime_ < head_->dueTime_) {
     // Insert at the head of the queue.
     task->next_ = head_;
@@ -49,7 +50,10 @@ void timer_context::enqueue(task_base* task) noexcept {
     head_ = task;
 
     auto now = clock_t::now();
-    std::uint16_t click_count = std::min(head_->dueTime_ - now, arduino::max_clicks).count();
+    const auto remaining = head_->dueTime_ - now;
+    const std::uint16_t click_count = std::min(remaining, arduino::max_clicks).count();
+    // Serial.println(remaining.count(), 2);
+    // Serial.println(click_count);
 
     // New minimum due-time has changed, set the hardware timer.
     noInterrupts();                          // disable all interrupts while interrupt parameters are changing
@@ -78,6 +82,7 @@ void timer_context::enqueue(task_base* task) noexcept {
     }
     queuedTask->next_ = task;
   }
+//   Serial.println("~e");
 }
 
 void timer_context::run() {
@@ -85,8 +90,9 @@ void timer_context::run() {
   TIMSK1 &= ~(1 << OCIE1A);             // disable future interrupts ie. CTC interrupt to give a 'one-shot' effect
   interrupts();                         // enable all interrupts
 
-  
-  while (!stop_ && head_ != nullptr && head_->dueTime_ <= clock_t::now()) {
+//   Serial.println('i');
+
+  while (!stop_ && head_ != nullptr) {
     auto now = clock_t::now();
     auto nextDueTime = head_->dueTime_;
     if (nextDueTime <= now) {
@@ -118,8 +124,11 @@ void timer_context::run() {
       TIMSK1 |= (1 << OCIE1A);                 // enable timer compare interrupt
       TCNT1 = 0;                               // set counter to 0
       interrupts();                            // enable all interrupts
+
+      break;
     }
   }
+//   Serial.println("~i");
 }
 
 void _timer_context::cancel_callback::operator()() noexcept {

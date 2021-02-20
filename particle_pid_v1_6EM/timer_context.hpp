@@ -276,6 +276,10 @@ namespace _timer_context {
     auto schedule() const noexcept {
       return schedule_after(std::chrono::milliseconds{0});
     }
+
+    auto now() const noexcept {
+      return clock_t::now();
+    }
   };
 } // namespace _timer_context
 

@@ -614,6 +614,7 @@ inline constexpr struct interval_fn {
 template<typename Clock, typename Receiver>
 struct interval_fn::op<Clock, Receiver>::tick_receiver {
   friend void tag_invoke(unifex::tag_t<unifex::set_value>, tick_receiver&& self) {
+    // Serial.println("sv");
     auto op = self.op_;
     auto tick = op->tick_;
     unifex::set_index(op->receiver_, tick);
@@ -624,6 +625,8 @@ struct interval_fn::op<Clock, Receiver>::tick_receiver {
       op->tick_
     ), tick_receiver{op}));
     unifex::start(op->tickOp_);
+    // Serial.println((long)(op->tick_ - op->scheduler_.now()).count());
+    // Serial.println("~sv");
   }
   template<typename Error>
   friend void tag_invoke(unifex::tag_t<unifex::set_error>, tick_receiver&& self, Error&& error) noexcept {
@@ -694,7 +697,13 @@ struct interval_fn::op<Clock, Receiver>::type {
     tickOp_(unifex::connect(
       unifex::schedule_at(scheduler_, tick_), 
       tick_receiver{this}))
-  {}
+  {
+    // Serial.println("op");
+    // Serial.println((long)(tick_ - scheduler_.now()).count());
+  }
+  ~type() {
+    // Serial.println("~op");
+  }
 
   type(const type&) = delete;
   type(type&&) = delete;

@@ -17,6 +17,27 @@
 #include <unifex/just.hpp>
 #include <unifex/on.hpp>
 
+struct receiver {
+  template <typename Index, typename... Values>
+  friend void tag_invoke(unifex::tag_t<unifex::set_index>, const receiver&, Index&&, Values&&...) noexcept {
+  }
+  friend void tag_invoke(unifex::tag_t<unifex::set_end>, receiver&&) noexcept {
+  }
+
+  template<typename... Vn>
+  friend void tag_invoke(unifex::tag_t<unifex::set_value>, receiver&&, Vn&&...) {
+  }
+
+  template<typename Error>
+  friend void tag_invoke(unifex::tag_t<unifex::set_error>, receiver&&, Error&& error) noexcept {
+  }
+  friend void tag_invoke(unifex::tag_t<unifex::set_done>, receiver&&) noexcept {
+  }
+  template <typename Cpo, typename... UVn>
+  friend void tag_invoke(unifex::tag_t<unifex::unwound>, const receiver&, Cpo, UVn&&...) noexcept {
+  }
+};
+
 //********************** PHYSICAL PARAMETERS **************************
 const float beam_width_mm = 15.0f;                                       // defined by the IRPS hardware geometry
 const float beam_width_um = beam_width_mm * 1000.0f;                     // a convenient float version of beam_width_mm to beam_width_mm (micrometers) to reduce calculation time
@@ -35,17 +56,15 @@ const float max_pulse_dist_mm =
   beam_center_mm + beam2em_dist_mm + em_center_mm;                       // all pulses will be relative to this max distance
 const float max_pulse_dist_um = max_pulse_dist_mm * 1000.0f;             // all pulses will be relative to this max distance
 
-const float clockHz = 16000000.0f;
-const int timer_prescaler = 8;
-const int timer_prescaler_mask = (0 << CS12) | (1 << CS11) | (0 << CS10);
-const float clicks_per_second = clockHz / timer_prescaler;
-const float clicks_per_us = clicks_per_second / 1000000.0f;              // eg. with an Arduino Uno (16Mhz clk/8), use 2 processor clicks per microsecond
-const unsigned long em_max_safe_clicks = 65536;                          // 16bit clock
+const float min_speed_mps = 1.5f; // slowest speed physically maintainable
+const float max_speed_mps = 8.0f; // highest speed physically attainable
+
 //*********************************************************************
 
 //********************** TIMER ****************************************
 using arduino_clock = typename unifex::timer_context::clock_t;
 using arduino_clicks = typename arduino_clock::duration;
+const unsigned long em_max_safe_clicks = arduino::max_clicks.count();
 unifex::timer_context timer;
 //*********************************************************************
 
@@ -82,14 +101,30 @@ const int high_no_switch = 852 + cv;
 double updateThrottle(const int pin) {
   float throttle = analogRead(pin);
   if (throttle < low_no_switch) {
-    return 1.50f;
+    return min_speed_mps;
   } else if (throttle > high_no_switch) {
-    return 8.0f;
+    return max_speed_mps;
   } else {
-    // map from throttle position to 1.50m/s - 8.00m/s
-    return map(throttle, low_no_switch, high_no_switch, 150, 800) / 100.0;
+    // map from throttle position to min - max speed in meters-per-second
+    return map(throttle, low_no_switch, high_no_switch, min_speed_mps * 100, max_speed_mps * 100) / 100.0;
   }
 }
+
+template<typename ATimeScheduler>
+void runThrottle(ATimeScheduler scheduler, const int pin) {
+  // update target_speed from throttle control.
+  static auto first = scheduler.now() + std::chrono::milliseconds(200);
+  static auto throttle_position_op = unifex::connect(  
+    unifex::interval(first, std::chrono::milliseconds(250)) 
+    | unifex::transform([&, pin](auto tick){
+        const double target_speed = updateThrottle(pin);
+        ppaPID.Setpoint(target_speed);
+        return target_speed;
+      }) 
+    | unifex::on(scheduler), receiver{});
+  static bool started = (unifex::start(throttle_position_op), true);
+}
+
 
 //IR sensors and EM's
 //NOTE: in board 11 onwards, OUT_FLAG is pulsed LOW to activate electromagnets.
@@ -259,7 +294,7 @@ class IRPS
         //  if the electromagnet is enabled for pulsing, calculate required timing
         if (enabled_ && pulse_dist_mm_ < max_dist_mm_) {
           start_time_ = s2_ + std::min(clicks_mm_ * (max_dist_mm_ - pulse_dist_mm_) * 1.00f, arduino::max_clicks);   // when EM pulse starts
-          end_time_ = s2_ + std::min(clicks_mm_ * max_dist_mm_ * 0.97f, arduino::max_clicks);                        // when EM pulse ends
+          end_time_ = s2_ + std::min(clicks_mm_ * max_dist_mm_ * 1.0f, arduino::max_clicks);                        // when EM pulse ends
         }
 
         String report;          // hold data for printing
@@ -463,45 +498,17 @@ static class EM& active_em() {
 
 unifex::manual_loop_context loop_context;
 
-struct receiver {
-  template <typename Index, typename... Values>
-  friend void tag_invoke(unifex::tag_t<unifex::set_index>, const receiver&, Index&&, Values&&...) noexcept {
-  }
-  friend void tag_invoke(unifex::tag_t<unifex::set_end>, receiver&&) noexcept {
-  }
-
-  template<typename... Vn>
-  friend void tag_invoke(unifex::tag_t<unifex::set_value>, receiver&&, Vn&&...) {
-  }
-
-  template<typename Error>
-  friend void tag_invoke(unifex::tag_t<unifex::set_error>, receiver&&, Error&& error) noexcept {
-  }
-  friend void tag_invoke(unifex::tag_t<unifex::set_done>, receiver&&) noexcept {
-  }
-  template <typename Cpo, typename... UVn>
-  friend void tag_invoke(unifex::tag_t<unifex::unwound>, const receiver&, Cpo, UVn&&...) noexcept {
-  }
-};
-
-//auto gen_op = unifex::connect(unifex::generate(1, 42) | unifex::transform([](int){}) | unifex::on(loop_context.get_scheduler()), receiver{});
-//auto start = arduino_clock::now() + std::chrono::milliseconds(200);
-//auto timer_op = unifex::connect(  
-//  unifex::interval(start, std::chrono::milliseconds(100)) 
-//  | unifex::transform([&](auto tick){
-//      Serial.println(int(std::chrono::duration_cast<std::chrono::milliseconds>(tick-start).count()));
-//    }) 
-//  | unifex::on(timer.get_scheduler()), receiver{});
-
 void setup() {
 
 //  unifex::start(gen_op);
 
   Serial.begin (115200);                      // start serial communication.
+  // high baud rate required to send data in limited time
+
+  Serial.println("setup");
 
 //  unifex::start(timer_op);
 
-  // high baud rate required to send data in limited time
   pinMode(ir_interrupt, INPUT);
   pinMode(ir_add0, INPUT);
   pinMode(ir_add1, INPUT);
@@ -560,13 +567,18 @@ void setup() {
     em[i].reset();
   }
 
+  runThrottle(unifex::get_scheduler(timer), thr);
+
   attachInterrupt(digitalPinToInterrupt(2), demuxINT, RISING);     // define interrupt based on rising edge of pin 2
 
+  Serial.println("~setup");
 }
 
 //MAIN LOOP
 void loop() {
-  wdt_enable(WDTO_500MS);
+//  wdt_enable(WDTO_500MS);
+
+  static bool looping = (Serial.println("first loop"), true);
 
   loop_context.run_once();
 
@@ -595,9 +607,7 @@ void loop() {
 
     float delta_time_us = irps_.get_delta_time_us();
 
-    const double target_speed = updateThrottle(thr);
-
-    ppaPID.Setpoint(target_speed);
+    const double target_speed = ppaPID.GetSetpoint();
 
     if (delta_time_us > 0) {
       const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
