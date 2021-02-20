@@ -113,16 +113,16 @@ double updateThrottle(const int pin) {
 template<typename ATimeScheduler>
 void runThrottle(ATimeScheduler scheduler, const int pin) {
   // update target_speed from throttle control.
-  static auto first = scheduler.now() + std::chrono::milliseconds(200);
+  static const auto first = scheduler.now() + std::chrono::milliseconds(200);
   static auto throttle_position_op = unifex::connect(  
     unifex::interval(first, std::chrono::milliseconds(250)) 
-    | unifex::transform([&, pin](auto tick){
+    | unifex::transform([pin](auto tick){
         const double target_speed = updateThrottle(pin);
         ppaPID.Setpoint(target_speed);
         return target_speed;
       }) 
     | unifex::on(scheduler), receiver{});
-  static bool started = (unifex::start(throttle_position_op), true);
+  static const bool started = (unifex::start(throttle_position_op), true);
 }
 
 
@@ -131,7 +131,6 @@ void runThrottle(ATimeScheduler scheduler, const int pin) {
 //set via polarity definitions below
 #define EM_ACTIVE LOW
 #define EM_DISABLE HIGH
-#include <QueueArray.h>
 
 volatile int irps_number = 0;             // holds the current IRPS being triggered
 
@@ -160,9 +159,6 @@ const int thr           = A4;
 //const int da            =18;    //A4   I2C for BMP280
 //const int cl            =19;    //A5   I2C for BMP280
 //***************************************************************************************
-
-// create a queue of characters for reporting over USB
-QueueArray <char> printqueue;
 
 enum class IRPSStatus {
   Ready = 0,
@@ -496,18 +492,55 @@ static class EM& active_em() {
   return em[active_irps().get_em_number()];
 }
 
+template<typename ATimeScheduler>
+void runDisplay(ATimeScheduler scheduler) {
+  // update display.
+  static const auto first = scheduler.now() + std::chrono::milliseconds(200);
+  static auto display_op = unifex::connect(  
+    unifex::interval(first, std::chrono::milliseconds(250)) 
+    | unifex::transform([](auto tick){
+        auto& irps_ = active_irps();
+        auto& em_ = active_em();
+        const float delta_time_us = irps_.get_delta_time_us();
+
+        if (irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off || delta_time_us < 0.0f) {
+          return;
+        }
+        const double target_speed = ppaPID.GetSetpoint();
+
+        const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
+
+        const auto yPos = map(speed * 100, 0, 1000, tft.height(), 49);  // scale actual speed (0.0-10.0 m/s) according to graph area on scale for plotting purposes
+        const auto yTargetPos = map(target_speed * 100, 0, 1000, tft.height(), 49);  // scale target speed (0.0-10.0 m/s) according to graph area on scale for plotting purposes
+    
+        //Manage screen scrolling
+        xPos = xPos + 1;
+        if (xPos > tft.width()) {
+          tft.fillRect(0, 49, tft.width(), tft.height() - 49, ILI9341_BLACK);
+          xPos = 0;
+        }
+    
+        tft.drawPixel( xPos, yPos, ILI9341_WHITE );
+        tft.drawPixel( xPos, yPos - 1, ILI9341_WHITE );
+        tft.drawPixel( xPos, yTargetPos, ILI9341_RED );
+  
+        tft.setCursor(0, 35);
+        tft.print(speed, 2);
+        tft.print(" - ");
+        tft.print(target_speed, 2);
+      }) 
+    | unifex::on(scheduler), receiver{});
+  static const bool started = (unifex::start(display_op), true);
+}
+
 unifex::manual_loop_context loop_context;
 
 void setup() {
-
-//  unifex::start(gen_op);
 
   Serial.begin (115200);                      // start serial communication.
   // high baud rate required to send data in limited time
 
   Serial.println("setup");
-
-//  unifex::start(timer_op);
 
   pinMode(ir_interrupt, INPUT);
   pinMode(ir_add0, INPUT);
@@ -536,23 +569,6 @@ void setup() {
   tft.setAddrWindow(0, 0, tft.width(), tft.height());
   display_main();
 
-  printqueue.setPrinter(Serial);
-  printqueue.enqueue('\0');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('=');
-  printqueue.enqueue('\0');
-
   irps_number = 0;
   last_irps_number = 0;
 
@@ -569,6 +585,8 @@ void setup() {
 
   runThrottle(unifex::get_scheduler(timer), thr);
 
+  runDisplay(unifex::get_scheduler(timer));
+
   attachInterrupt(digitalPinToInterrupt(2), demuxINT, RISING);     // define interrupt based on rising edge of pin 2
 
   Serial.println("~setup");
@@ -578,24 +596,12 @@ void setup() {
 void loop() {
 //  wdt_enable(WDTO_500MS);
 
-  static bool looping = (Serial.println("first loop"), true);
+  static const bool looping = (Serial.println("first loop"), true);
 
   loop_context.run_once();
 
   auto& irps_ = active_irps();
   auto& em_ = active_em();
-
-  // Output to serial connection
-  if (irps_.get_irps_number() == 0 && irps_.get_status() != IRPSStatus::Entered && em_.get_status() == EMStatus::Off) {
-    while (!printqueue.isEmpty ()) {
-      char next = printqueue.dequeue();
-      if (next != '\0') {
-        Serial.print(next);
-      } else {
-        Serial.println("");
-      }
-    }
-  }
 
   if (irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
     return;
@@ -607,42 +613,11 @@ void loop() {
 
     float delta_time_us = irps_.get_delta_time_us();
 
-    const double target_speed = ppaPID.GetSetpoint();
-
     if (delta_time_us > 0) {
       const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
-
       const double output_mm = ppaPID.Run(speed) / 1000.0f;
 
       irps_.set_pulse_dist_mm(output_mm);
-
-//      const float delta_clicks_ = delta_time_us * clicks_per_us;   //convert microseconds to clicks
-//      const float clicks_mm_ = delta_clicks_ / interbeam_dist_mm;  //convert clicks to clicks per mm
-
-      const auto yPos = map(speed * 100, 0, 1000, tft.height(), 49);  // scale actual speed (0.0-10.0 m/s) according to graph area on scale for plotting purposes
-      const auto yTargetPos = map(target_speed * 100, 0, 1000, tft.height(), 49);  // scale target speed (0.0-10.0 m/s) according to graph area on scale for plotting purposes
-  
-      //Manage screen scrolling
-      xPos = xPos + 1;
-      if (xPos > tft.width()) {
-        tft.fillRect(0, 49, tft.width(), tft.height() - 49, ILI9341_BLACK);
-        xPos = 0;
-      }
-  
-      tft.drawPixel( xPos, yPos, ILI9341_WHITE );
-      tft.drawPixel( xPos, yPos - 1, ILI9341_WHITE );
-      tft.drawPixel( xPos, yTargetPos, ILI9341_RED );
-
-      tft.setCursor(0, 35);
-      tft.print(speed, 2);
-      tft.print(" - ");
-      tft.print(target_speed, 2);
-      tft.print(" - ");
-      tft.print(output_mm, 2);
-      tft.print("mm ");
-//      tft.print(" - ");
-//      tft.print(clicks_mm_ * output_mm, 2);
-//      tft.print("cl ");
     }
   }
 }   //end of main loop
@@ -655,8 +630,6 @@ void demuxINT() {
 
   if (irps_number < 0 || irps_number >= irpsCount) {
     irps_number = 0;
-    printqueue.enqueue('$');
-    printqueue.enqueue('\0');
     return;
   }
 
@@ -670,14 +643,6 @@ void demuxINT() {
     // if a pulse is required, then send parameters to EM function
     if (current_event.irps_status == IRPSStatus::Exited && current_event.startTime > now ) {
       em[current_event.em_number].setup_timer(current_event);
-    }
-
-    // enqueue log output
-    int string_length = current_event.print_string.length();
-    if (string_length > 2) {
-      for (int i = 0; i <= string_length && !printqueue.isFull(); ++i) {
-        printqueue.enqueue(current_event.print_string.charAt(i));
-      }
     }
   }
 }
