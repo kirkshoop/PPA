@@ -1,6 +1,21 @@
+#include "stdlibpatch.h"
 
 #include <avr/wdt.h>            // library for default watchdog functions
 #include <avr/interrupt.h>      // library for interrupts handling
+
+#include <type_traits>
+#include <atomic>
+#include <limits>
+
+#include <unifex/receiver_concepts.hpp>
+#include <unifex/sender_concepts.hpp>
+#include <unifex/scheduler_concepts.hpp>
+
+#include "manual_loop_context.hpp"
+#include "timer_context.hpp"
+#include "sequence.hpp"
+#include <unifex/just.hpp>
+#include <unifex/on.hpp>
 
 //********************** PHYSICAL PARAMETERS **************************
 const float beam_width_mm = 15.0f;                                       // defined by the IRPS hardware geometry
@@ -28,6 +43,11 @@ const float clicks_per_us = clicks_per_second / 1000000.0f;              // eg. 
 const unsigned long em_max_safe_clicks = 65536;                          // 16bit clock
 //*********************************************************************
 
+//********************** TIMER ****************************************
+using arduino_clock = typename unifex::timer_context::clock_t;
+using arduino_clicks = typename arduino_clock::duration;
+unifex::timer_context timer;
+//*********************************************************************
 
 //********************** SCREEN ***************************************
 #include "SPI.h"
@@ -43,7 +63,7 @@ Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
 #include "PID_v2.h"
 // Specify the links and initial tuning parameters
 //double Kp = 4, Ki = 0.2, Kd = 0.1;
-const float max_pid_em_output_um = max_pulse_dist_um * 0.5f;
+const float max_pid_em_output_um = max_pulse_dist_um * 0.6f;
 const float min_pid_em_output_um = 800.0f;
 // Ziegler–Nichols method for tuning PID
 double Ku = (max_pid_em_output_um * 0.50f) - min_pid_em_output_um, Tu = 2.00f; 
@@ -119,10 +139,10 @@ enum class IRPSStatus {
 struct ir_event {
   int irps_number;
   int em_number;
-  unsigned long wait_duration;    // the number of clicks between the second beam interruption and the start of EM activation
-  unsigned long pulse_duration;   // the number of clicks the EM is activated
-  String print_string;            // the reporting string to be sent over USB
-  IRPSStatus irps_status;         // indicates prior first beam break (0), after first beam break (1), and after second beam break (2)
+  arduino_clock::time_point startTime; // when the EM is activated
+  arduino_clock::time_point endTime;   // when the EM is deactivated
+  String print_string;                 // the reporting string to be sent over USB
+  IRPSStatus irps_status;              // indicates prior first beam break (0), after first beam break (1), and after second beam break (2)
 };
 
 //Infra-Red Position Sensor (IRPS)
@@ -139,9 +159,9 @@ class IRPS
     bool send_to_print_stack_; // flag indicates whether beam break events are printed to stack for subsequent sending over USB
 
     // Store the current state
-    IRPSStatus irps_status_;   // status of IRPS
-    unsigned long s1_us;       // s1_us is when first beam is interrupted
-    unsigned long s2_us;       // s2_us is when second beam is interrupted
+    IRPSStatus irps_status_;        // status of IRPS
+    arduino_clock::time_point s1_;  // s1_us is when first beam is interrupted
+    arduino_clock::time_point s2_;  // s2_us is when second beam is interrupted
 
     // Constructor - creates a IRPS
     // and initializes the member variables and state
@@ -167,12 +187,11 @@ class IRPS
 
     void reset() {
       irps_status_ = IRPSStatus::Ready;
-      s1_us = 0;
-      s2_us = 0;
+      s1_ = s2_ = arduino_clock::time_point{};
     }
 
     void set_pulse_dist_mm(int pulse_mm) {
-      pulse_dist_mm_ = min(pulse_mm, max_dist_mm_);
+      pulse_dist_mm_ = std::min(pulse_mm, max_dist_mm_);
     }
     
     IRPSStatus get_status() {
@@ -188,11 +207,14 @@ class IRPS
     }
     
     // microseconds between first and second beam breaks
-    float get_delta_time_us() {
-      if (irps_status_ == IRPSStatus::Exited && s1_us != 0 && s2_us != 0) {
-        return s2_us - s1_us;
+    arduino_clicks get_delta_time() {
+      if (irps_status_ == IRPSStatus::Exited && s1_ != arduino_clock::time_point{} && s2_ != arduino_clock::time_point{}) {
+        return s2_ - s1_;
       }
-      return -1.0f; // invalid
+      return arduino_clicks{-1.0f}; // invalid
+    }
+    float get_delta_time_us() {
+      return std::chrono::duration_cast<std::chrono::microseconds>(get_delta_time()).count();
     }
 
     // The main function that is called when a beam interrupt occurs
@@ -200,45 +222,44 @@ class IRPS
     {
 
       //    first infrared beam has been broken in a valid state
-      if (irps_number == irps_number_ && irps_status_ == IRPSStatus::Ready && s1_us == 0 && s2_us == 0) {
-        s1_us = micros();                   // record beam break time
+      if (irps_number == irps_number_ && irps_status_ == IRPSStatus::Ready && s1_ == arduino_clock::time_point{} && s2_ == arduino_clock::time_point{}) {
+        s1_ = arduino_clock::now();         // record beam break time
         irps_status_ = IRPSStatus::Entered; // update status to show first beam break
         String report;                      // hold data for printing
         if (send_to_print_stack_ == true) {
 //          report = "<";
         }
-        ir_event temp = {irps_number_ , em_number_, 0, 0, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when first beam has been broken
+        ir_event temp = {irps_number_ , em_number_, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when first beam has been broken
         return temp;
       }
 
       //    second infrared beam has been broken in a valid state
-      else if (irps_number == irps_number_ && irps_status_ == IRPSStatus::Entered && s1_us != 0 && s2_us == 0) {
-        s2_us = micros();   // record beam break time
+      else if (irps_number == irps_number_ && irps_status_ == IRPSStatus::Entered && s1_ != arduino_clock::time_point{} && s2_ == arduino_clock::time_point{}) {
+        s2_ = arduino_clock::now();          // record beam break time
         irps_status_ = IRPSStatus::Exited;   // update status to show second beam break
 
-        const float delta_time_us_ = get_delta_time_us();             //time between first and second beam breaks
-        const float delta_clicks_ = delta_time_us_ * clicks_per_us;   //convert microseconds to clicks
-        const float clicks_mm_ = delta_clicks_ / interbeam_dist_mm_;  //convert clicks to clicks per mm
+        const auto delta_clicks_ = get_delta_time();             //time between first and second beam breaks
+        const auto clicks_mm_ = delta_clicks_ / interbeam_dist_mm_;  //convert clicks to clicks per mm
 
 
         // reset when irps measurment invalid
-        if (delta_time_us_ < 0.0f) {
+        if (delta_clicks_.count() < 0.0f) {
           reset();
           String report;          // hold data for printing
           if (send_to_print_stack_ == true) {
             report = "r" + String(irps_number);
           }
-          ir_event temp = {irps_number_ , em_number_, 0, 0, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when resetting
+          ir_event temp = {irps_number_ , em_number_, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when resetting
           return temp;
         }
 
-        unsigned long wait_clicks_ = 0;             //reset calculation variable
-        unsigned long pulse_clicks_ = 0;            //reset calculation variable
+        arduino_clock::time_point start_time_;
+        arduino_clock::time_point end_time_;
 
         //  if the electromagnet is enabled for pulsing, calculate required timing
-        if (enabled_) {
-          pulse_clicks_ = clicks_mm_ * pulse_dist_mm_;                   // pulse_clicks is number of clicks of EM pulse duration
-          wait_clicks_ = clicks_mm_ * (max_dist_mm_ - pulse_dist_mm_) * 0.96f;   // wait_clicks is number of clicks before starting EM pulse
+        if (enabled_ && pulse_dist_mm_ < max_dist_mm_) {
+          start_time_ = s2_ + std::min(clicks_mm_ * (max_dist_mm_ - pulse_dist_mm_) * 1.00f, arduino::max_clicks);   // when EM pulse starts
+          end_time_ = s2_ + std::min(clicks_mm_ * max_dist_mm_ * 0.97f, arduino::max_clicks);                        // when EM pulse ends
         }
 
         String report;          // hold data for printing
@@ -248,7 +269,7 @@ class IRPS
 //          report = String(irps_number_) + ", " + String(speed_, 2);
         }
 
-        ir_event temp = {irps_number_ , em_number_, wait_clicks_, pulse_clicks_, report, irps_status_};
+        ir_event temp = {irps_number_ , em_number_, start_time_, end_time_, report, irps_status_};
         return temp;
       }
 
@@ -260,7 +281,7 @@ class IRPS
         report = "b" + String(irps_number) + "," + String(int(irps_status_));
       }
       reset();
-      ir_event temp = {irps_number_ , em_number_, 0, 0, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when
+      ir_event temp = {irps_number_ , em_number_, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when
       return temp;
     }
    
@@ -295,12 +316,49 @@ enum class EMStatus {
 
 class EM
 {
+    struct timer_complete {
+      EM& em_;
+      ir_event fire_;
+
+      auto& get_timer_op() {
+        return em_.timer_op_;
+      }
+    
+      template<typename... Vn>
+      friend void tag_invoke(unifex::tag_t<unifex::set_value>, timer_complete&& self, Vn&&...) {
+        timer_complete next{std::move(self)};
+        
+        next.get_timer_op().destruct();
+
+        if (next.em_.get_status() == EMStatus::Pending) {
+          next.em_.startPulse(std::move(next.fire_));
+        }
+        else if (next.em_.get_status() == EMStatus::On) {
+          next.em_.stopPulse();
+        } 
+      }
+    
+      template<typename Error>
+      friend void tag_invoke(unifex::tag_t<unifex::set_error>, timer_complete&& self, Error&& error) noexcept {
+        self.em_.stopPulse();
+        self.get_timer_op().destruct();
+      }
+      friend void tag_invoke(unifex::tag_t<unifex::set_done>, timer_complete&& self) noexcept {
+        self.em_.stopPulse();
+        self.get_timer_op().destruct();
+      }
+    };
+    friend struct timer_complete;
     // Class Member Variables, initialized at startup
     int em_number_;   // the number of the EM
     bool enabled_;    // flag indicates whether the EM can be turned on
     EMStatus status_;       // EM - pending, on, off
-    unsigned long actual_pulse_clicks_;    // the requested pulse duration
     unsigned long safetime_;    // the maximum allowed pulse duration
+    unifex::manual_lifetime<unifex::connect_result_t<
+      unifex::schedule_at_result_t<std::decay_t<
+        unifex::get_scheduler_result_t<unifex::timer_context&>>&,
+          const typename arduino_clock::time_point&>,
+      timer_complete>> timer_op_;
 
     // These maintain the current state
     // Constructor - creates an EM
@@ -312,6 +370,9 @@ class EM
       enabled_ = enabled;
       safetime_ = safetime;
     }
+
+    arduino::steady_clock::time_point waitTime_;
+    arduino::steady_clock::time_point pulseTime_;
 
   public:
 
@@ -326,18 +387,6 @@ class EM
     }
 
     void reset() {
-      digitalWrite(out_flag, EM_DISABLE);   // disable EM
-      noInterrupts();                       // disable all interrupts
-      TIMSK1 &= ~(1 << OCIE1A);             // disable future interrupts ie. CTC interrupt to give a 'one-shot' effect
-      status_ = EMStatus::Off;              // recognise that EM is Off
-      interrupts();                         // enable all interrupts
-    }
-
-    void set_pulse_clicks(unsigned long pulse_clicks) {
-      actual_pulse_clicks_ = min(pulse_clicks, safetime_); // restrict pulse duration to maximum safe value
-    }
-    unsigned long get_pulse_clicks() {
-      return actual_pulse_clicks_;
     }
 
     EMStatus get_status() {
@@ -348,59 +397,47 @@ class EM
     }
 
     void setup_timer(ir_event fire) {
-      digitalWrite(out_flag, EM_DISABLE);   // ensure EM is OFF during waiting period
+      stopPulse();   // ensure EM is OFF during waiting period
 
-      set_pulse_clicks(fire.pulse_duration);
+      waitTime_ = fire.startTime;
+      pulseTime_ = fire.endTime;
+
 
 //      digitalWrite(scope0_toggle, LOW);     // display wait period start on scope
-
+      
       //    write EM output address prior to energising output line
       digitalWrite(out_add0, em_number_ & 1);
       digitalWrite(out_add1, em_number_ & 2);
       digitalWrite(out_add2, em_number_ & 4);
 
-      if (fire.wait_duration > 0) {
-        //    Set up interrupt to wait for right time to start the pulse
+      if (fire.startTime > arduino_clock::now()) {
+        stopPulse();
         set_status(EMStatus::Pending);          // Set EM is in waiting period 
-        startTimer(fire.wait_duration);
-  
+        //    Set up timer to wait for right time to start the pulse
+        auto& timerOp = timer_op_.construct_from([&, this]() noexcept {
+          return unifex::connect(unifex::schedule_at(unifex::get_scheduler(timer), fire.startTime), timer_complete{*this, fire});
+        });
+        unifex::start(timerOp);
       } else {
-        startPulse();
+        startPulse(std::move(fire));
       }
     }
 
-    void startTimer(unsigned long clicks) {
-      noInterrupts();                         // disable all interrupts while interrupt parameters are changing
-      TCCR1A = 0;                             // reset all bits
-      TCCR1B = 0;                             // reset all bits
-      OCR1A = clicks;                         // input is already in clicks, in theory should subtract 1
-      TCCR1B |= (1 << WGM12);                 // CTC mode
-      TCCR1B |= timer_prescaler_mask;         // On a 16MHz Arduino, a prescaler of 64 gives a 4usecond click
-      TIFR1 |= (1 << OCF1A);                  // clear
-
-      TIMSK1 |= (1 << OCIE1A);                // enable timer compare interrupt
-      TCNT1 = 0;                              // set counter to 0
-      interrupts();                           // enable all interrupts
-    }
-
-    void stopTimer() {
-      noInterrupts();                       // disable all interrupts
-      TIMSK1 &= ~(1 << OCIE1A);             // disable future interrupts ie. CTC interrupt to give a 'one-shot' effect
-      interrupts();                         // enable all interrupts
-    }
-
-    void startPulse() {
+    void startPulse(ir_event fire) {
 //    digitalWrite(scope0_toggle, HIGH);    // display wait period end on scope
 
       digitalWrite(out_flag, EM_ACTIVE);    // enable the EM
       set_status(EMStatus::On);             // Set EM is now energised
-      startTimer(get_pulse_clicks());
+      //    Set up timer to wait for right time to stop the pulse
+      auto& timerOp = timer_op_.construct_from([&, this]() noexcept {
+        return unifex::connect(unifex::schedule_at(unifex::get_scheduler(timer), fire.endTime), timer_complete{*this, fire});
+      });
+      unifex::start(timerOp);
     }
 
     void stopPulse() {
       digitalWrite(out_flag, EM_DISABLE);   // disable EM
       set_status(EMStatus::Off);            // clear status to show EM is off
-      stopTimer();
     }
 
 };    //end of EM class
@@ -424,26 +461,45 @@ static class EM& active_em() {
   return em[active_irps().get_em_number()];
 }
 
-// **********   Hardware timing interrupt event  ***************
+unifex::manual_loop_context loop_context;
 
-ISR(TIMER1_COMPA_vect) // timer compare interrupt service routine
-{
-  auto& em_ = em[EM::readEmAddress()];
-
-  //for end of pulse, send disable output quickly
-  if (em_.get_status() == EMStatus::On) {
-    em_.stopPulse();
+struct receiver {
+  template <typename Index, typename... Values>
+  friend void tag_invoke(unifex::tag_t<unifex::set_index>, const receiver&, Index&&, Values&&...) noexcept {
+  }
+  friend void tag_invoke(unifex::tag_t<unifex::set_end>, receiver&&) noexcept {
   }
 
-  //for start of pulse, send activate output
-  else if (em_.get_status() == EMStatus::Pending) {
-    em_.startPulse();
+  template<typename... Vn>
+  friend void tag_invoke(unifex::tag_t<unifex::set_value>, receiver&&, Vn&&...) {
   }
-}
+
+  template<typename Error>
+  friend void tag_invoke(unifex::tag_t<unifex::set_error>, receiver&&, Error&& error) noexcept {
+  }
+  friend void tag_invoke(unifex::tag_t<unifex::set_done>, receiver&&) noexcept {
+  }
+  template <typename Cpo, typename... UVn>
+  friend void tag_invoke(unifex::tag_t<unifex::unwound>, const receiver&, Cpo, UVn&&...) noexcept {
+  }
+};
+
+//auto gen_op = unifex::connect(unifex::generate(1, 42) | unifex::transform([](int){}) | unifex::on(loop_context.get_scheduler()), receiver{});
+//auto start = arduino_clock::now() + std::chrono::milliseconds(200);
+//auto timer_op = unifex::connect(  
+//  unifex::interval(start, std::chrono::milliseconds(100)) 
+//  | unifex::transform([&](auto tick){
+//      Serial.println(int(std::chrono::duration_cast<std::chrono::milliseconds>(tick-start).count()));
+//    }) 
+//  | unifex::on(timer.get_scheduler()), receiver{});
 
 void setup() {
 
+//  unifex::start(gen_op);
+
   Serial.begin (115200);                      // start serial communication.
+
+//  unifex::start(timer_op);
 
   // high baud rate required to send data in limited time
   pinMode(ir_interrupt, INPUT);
@@ -511,6 +567,8 @@ void setup() {
 //MAIN LOOP
 void loop() {
   wdt_enable(WDTO_500MS);
+
+  loop_context.run_once();
 
   auto& irps_ = active_irps();
   auto& em_ = active_em();
@@ -592,13 +650,15 @@ void demuxINT() {
     return;
   }
 
+  auto now = arduino_clock::now();
+
   // notify all irps of interrupt
   for (int i = 0; i < irpsCount; i++) {
     //call function to process IR interrupt
     struct ir_event current_event = irps[i].handleStatus(irps_number);
 
     // if a pulse is required, then send parameters to EM function
-    if (current_event.irps_status == IRPSStatus::Exited && current_event.pulse_duration > 0 ) {
+    if (current_event.irps_status == IRPSStatus::Exited && current_event.startTime > now ) {
       em[current_event.em_number].setup_timer(current_event);
     }
 
