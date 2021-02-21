@@ -51,7 +51,17 @@ namespace arduino {
 
     static time_point
     now() noexcept {
-      return time_point{std::chrono::duration_cast<clicks>(std::chrono::microseconds(micros()))};
+      // make sure that the time_points for now are stable 
+      // across rollover of the micros() counter
+      // based on https://arduino.stackexchange.com/a/12588
+      static clicks lowClicks, highClicks;
+      constexpr clicks rolloverIncrementClicks = std::chrono::duration_cast<clicks>(std::chrono::microseconds(std::numeric_limits<std::uint32_t>::max())) + std::chrono::duration_cast<clicks>(std::chrono::microseconds(1));
+      const clicks nowClicks = std::chrono::duration_cast<clicks>(std::chrono::microseconds(micros()));
+      if (nowClicks < lowClicks) {
+        highClicks += rolloverIncrementClicks;
+      }
+      lowClicks = nowClicks;
+      return time_point{lowClicks + highClicks};
     }
   };
 }
