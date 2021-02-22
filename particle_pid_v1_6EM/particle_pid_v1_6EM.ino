@@ -13,6 +13,7 @@
 
 #include "manual_loop_context.hpp"
 #include "timer_context.hpp"
+#include "interrupt_context.hpp"
 #include "sequence.hpp"
 #include <unifex/just.hpp>
 #include <unifex/on.hpp>
@@ -559,6 +560,36 @@ void runDisplay(ATimeScheduler scheduler) {
 }
 
 unifex::manual_loop_context loop_context;
+unifex::interrupt_context irps_context;
+
+void runIrps() {
+  static auto irps_op = unifex::connect(  
+    irps_context.all_interrupts()
+    | unifex::transform([](auto index){
+        //demultiplexes hardware ir_interrupt and calls relevant Speed Sensor (IRPS) based on address
+      
+        irps_number = IRPS::readIrpsAddress();
+      
+        if (irps_number < 0 || irps_number >= irpsCount) {
+          irps_number = 0;
+          return;
+        }
+      
+        auto now = unifex::get_scheduler(timer).now();
+      
+        // notify all irps of interrupt
+        for (int i = 0; i < irpsCount; i++) {
+          //call function to process IR interrupt
+          struct ir_event current_event = irps[i].handleStatus(irps_number);
+      
+          // if a pulse is required, then send parameters to EM function
+          if (current_event.irps_status == IRPSStatus::Exited && current_event.startTime > now ) {
+            em[current_event.em_number].setup_timer(current_event);
+          }
+        }
+      }), receiver{});
+  static const bool started = (unifex::start(irps_op), irps_context.attach(ir_interrupt, RISING), true);
+}
 
 void setup() {
 
@@ -612,7 +643,7 @@ void setup() {
 
   runDisplay(unifex::get_scheduler(timer));
 
-  attachInterrupt(digitalPinToInterrupt(2), demuxINT, RISING);     // define interrupt based on rising edge of pin 2
+  runIrps();
 
   Serial.println("~setup");
 }
@@ -646,31 +677,6 @@ void loop() {
     }
   }
 }   //end of main loop
-
-void demuxINT() {
- 
-  //demultiplexes hardware ir_interrupt and calls relevant Speed Sensor (IRPS) based on address
-
-  irps_number = IRPS::readIrpsAddress();
-
-  if (irps_number < 0 || irps_number >= irpsCount) {
-    irps_number = 0;
-    return;
-  }
-
-  auto now = unifex::get_scheduler(timer).now();
-
-  // notify all irps of interrupt
-  for (int i = 0; i < irpsCount; i++) {
-    //call function to process IR interrupt
-    struct ir_event current_event = irps[i].handleStatus(irps_number);
-
-    // if a pulse is required, then send parameters to EM function
-    if (current_event.irps_status == IRPSStatus::Exited && current_event.startTime > now ) {
-      em[current_event.em_number].setup_timer(current_event);
-    }
-  }
-}
 
 void display_main() {
   tft.fillScreen(ILI9341_BLACK);
