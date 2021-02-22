@@ -497,7 +497,7 @@ void runDisplay(ATimeScheduler scheduler) {
   // update display.
   static const auto first = scheduler.now() + std::chrono::milliseconds(200);
   static auto display_op = unifex::connect(  
-    unifex::interval(first, std::chrono::milliseconds(57)) 
+    unifex::interval(first, std::chrono::milliseconds(37)) 
     | unifex::transform([](auto tick){
 
         auto& irps_ = active_irps();
@@ -506,6 +506,7 @@ void runDisplay(ATimeScheduler scheduler) {
         auto tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tick.time_since_epoch());
 
         if (irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
+          // do not draw until after the active IRPS has measured the speed and the active EM has completed the pulse
           return;
         }
 
@@ -519,6 +520,7 @@ void runDisplay(ATimeScheduler scheduler) {
 
         const float delta_time_us = irps_.get_delta_time_us();
         if (delta_time_us <= 0.0f) {
+          // only draw valid data
           return;
         }
 
