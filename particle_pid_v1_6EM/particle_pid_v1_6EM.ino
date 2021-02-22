@@ -39,6 +39,17 @@ struct receiver {
   }
 };
 
+//********************** UNIFEX CONTEXTS ******************************
+unifex::manual_loop_context loop_context;
+unifex::interrupt_context irps_context;
+
+using arduino_clock = typename unifex::timer_context::clock_t;
+using arduino_clicks = typename arduino_clock::duration;
+const unsigned long em_max_safe_clicks = arduino::max_clicks.count();
+unifex::timer_context timer;
+//*********************************************************************
+
+
 //********************** PHYSICAL PARAMETERS **************************
 const float beam_width_mm = 15.0f;                                       // defined by the IRPS hardware geometry
 const float beam_width_um = beam_width_mm * 1000.0f;                     // a convenient float version of beam_width_mm to beam_width_mm (micrometers) to reduce calculation time
@@ -60,13 +71,6 @@ const float max_pulse_dist_um = max_pulse_dist_mm * 1000.0f;             // all 
 const float min_speed_mps = 1.8f; // slowest speed physically maintainable
 const float max_speed_mps = 8.0f; // highest speed physically attainable
 
-//*********************************************************************
-
-//********************** TIMER ****************************************
-using arduino_clock = typename unifex::timer_context::clock_t;
-using arduino_clicks = typename arduino_clock::duration;
-const unsigned long em_max_safe_clicks = arduino::max_clicks.count();
-unifex::timer_context timer;
 //*********************************************************************
 
 //********************** SCREEN ***************************************
@@ -114,9 +118,8 @@ double updateThrottle(const int pin) {
 template<typename ATimeScheduler>
 void runThrottle(ATimeScheduler scheduler, const int pin) {
   // update target_speed from throttle control.
-  static const auto first = scheduler.now() + std::chrono::milliseconds(200);
   static auto throttle_position_op = unifex::connect(  
-    unifex::interval(first, std::chrono::milliseconds(250)) 
+    unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(250)) 
     | unifex::transform([pin](auto tick){
         const double target_speed = updateThrottle(pin);
         ppaPID.Setpoint(target_speed);
@@ -134,10 +137,6 @@ void runThrottle(ATimeScheduler scheduler, const int pin) {
 #define EM_DISABLE HIGH
 
 volatile int irps_number = 0;             // holds the current IRPS being triggered
-
-//Screen and reporting variables
-int xPos = 0;         // the x-position of the rolling velocity graph, which is incremented as the graph covers the screen
-int last_irps_number = 0;
 
 //*************************** PINOUT PARAMETERS ******************************************
 //Pinouts - see 'arduino pin selection.jpg'
@@ -250,12 +249,12 @@ class IRPS
     }
 
     // The main function that is called when a beam interrupt occurs
-    ir_event handleStatus(int irps_number)
+    ir_event handleStatus(int irps_number, unifex::timer_context::time_point now)
     {
 
       //    first infrared beam has been broken in a valid state
       if (irps_number == irps_number_ && irps_status_ == IRPSStatus::Ready && s1_ == arduino_clock::time_point{} && s2_ == arduino_clock::time_point{}) {
-        s1_ = unifex::get_scheduler(timer).now();  // record beam break time
+        s1_ = now;                                 // record beam break time
         irps_status_ = IRPSStatus::Entered;        // update status to show first beam break
         String report;                             // hold data for printing
         if (send_to_print_stack_ == true) {
@@ -267,8 +266,8 @@ class IRPS
 
       //    second infrared beam has been broken in a valid state
       else if (irps_number == irps_number_ && irps_status_ == IRPSStatus::Entered && s1_ != arduino_clock::time_point{} && s2_ == arduino_clock::time_point{}) {
-        s2_ = unifex::get_scheduler(timer).now();  // record beam break time
-        irps_status_ = IRPSStatus::Exited;         // update status to show second beam break
+        s2_ = now;                           // record beam break time
+        irps_status_ = IRPSStatus::Exited;   // update status to show second beam break
 
         const auto delta_clicks_ = get_delta_time();                 // time between first and second beam breaks
         const auto clicks_mm_ = delta_clicks_ / interbeam_dist_mm_;  // convert clicks to clicks per mm
@@ -460,6 +459,7 @@ class EM
 
       digitalWrite(out_flag, EM_ACTIVE);    // enable the EM
       set_status(EMStatus::On);             // Set EM is now energised
+
       //    Set up timer to wait for right time to stop the pulse
       auto& timerOp = timer_op_.construct_from([&, this]() noexcept {
         return unifex::connect(unifex::schedule_at(unifex::get_scheduler(timer), fire.endTime), timer_complete{*this, fire});
@@ -494,12 +494,41 @@ static class EM& active_em() {
 }
 
 template<typename ATimeScheduler>
+void runPid(ATimeScheduler scheduler) {
+  static int xPos = 0;
+  // update PID output.
+  static auto pid_op = unifex::connect(  
+    unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(47)) 
+    | unifex::transform([](auto tick){
+        auto& irps_ = active_irps();
+        auto& em_ = active_em();
+  
+        if (irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
+          // do not update pid until after the active IRPS has measured the speed and the active EM has completed the pulse
+          return;
+        }
+  
+        const float delta_time_us = irps_.get_delta_time_us();
+        if (delta_time_us <= 0.0f) {
+          // only update with valid data
+          return;
+        }
+  
+        const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
+        const double output_mm = ppaPID.Run(speed) / 1000.0f;
+  
+        irps_.set_pulse_dist_mm(output_mm);
+      }) 
+    | unifex::on(scheduler), receiver{});
+  static const bool started = (unifex::start(pid_op), true);
+}
+
+template<typename ATimeScheduler>
 void runDisplay(ATimeScheduler scheduler) {
   // update display.
-  static const auto first = scheduler.now() + std::chrono::milliseconds(200);
   static auto display_op = unifex::connect(  
-    unifex::interval(first, std::chrono::milliseconds(37)) 
-    | unifex::transform([](auto tick){
+    unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(33)) 
+    | unifex::transform([xPos = 0](auto tick) mutable {
 
         auto& irps_ = active_irps();
         auto& em_ = active_em();
@@ -511,7 +540,14 @@ void runDisplay(ATimeScheduler scheduler) {
           return;
         }
 
-        const auto xPos_ = map(tick_ms.count() % 60'000, 0, 60'000, 0, tft.width());  // scale actual speed according to graph area on scale for plotting purposes
+        const float delta_time_us = irps_.get_delta_time_us();
+        if (delta_time_us <= 0.0f) {
+          // only draw valid data
+          return;
+        }
+
+        constexpr auto sixty_seconds = 60'000;
+        const auto xPos_ = map(tick_ms.count() % sixty_seconds, 0, sixty_seconds, 0, tft.width());  // scale actual speed according to graph area on scale for plotting purposes
 
         if (xPos == xPos_) {
           // only draw once per unique pixel
@@ -519,34 +555,28 @@ void runDisplay(ATimeScheduler scheduler) {
         }
         xPos = xPos_;
 
-        const float delta_time_us = irps_.get_delta_time_us();
-        if (delta_time_us <= 0.0f) {
-          // only draw valid data
-          return;
-        }
+        const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
 
         const double target_speed = ppaPID.GetSetpoint();
-
-        const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
 
         const auto yPos = map(speed * 100, 0, 1000, tft.height(), 52);  // scale actual speed according to graph area on scale for plotting purposes
         const auto yTargetPos = map(target_speed * 100, 0, 1000, tft.height(), 52);  // scale target speed according to graph area on scale for plotting purposes
 
         // clear next line
-        tft.drawFastVLine(xPos, 52, tft.height() - 52, ILI9341_BLACK);
-        tft.drawFastVLine(xPos + 1, 52, tft.height() - 52, ILI9341_BLACK);
-        tft.drawFastVLine(xPos + 2, 52, tft.height() - 52, ILI9341_BLACK);
+        tft.drawFastVLine(xPos_, 52, tft.height() - 52, ILI9341_BLACK);
+        tft.drawFastVLine(xPos_ + 1, 52, tft.height() - 52, ILI9341_BLACK);
+        tft.drawFastVLine(xPos_ + 2, 52, tft.height() - 52, ILI9341_BLACK);
 
         // indicator for current position
         tft.drawFastHLine(0, tft.height() - 2, tft.width(), ILI9341_BLACK);
         tft.drawFastHLine(0, tft.height() - 1, tft.width(), ILI9341_BLACK);
-        tft.drawFastVLine( xPos, tft.height() - 2, 2, ILI9341_GREEN );
+        tft.drawFastVLine( xPos_, tft.height() - 2, 2, ILI9341_GREEN );
 
         // actual speed
-        tft.drawFastVLine( xPos, yPos, 2, ILI9341_WHITE );
+        tft.drawFastVLine( xPos_, yPos, 2, ILI9341_WHITE );
 
         // target speed
-        tft.drawPixel( xPos, yTargetPos, ILI9341_RED );
+        tft.drawPixel( xPos_, yTargetPos, ILI9341_RED );
   
         tft.setCursor(0, 35);
         tft.print(speed, 2);
@@ -556,11 +586,18 @@ void runDisplay(ATimeScheduler scheduler) {
         tft.print((long)tick_ms.count());
       }) 
     | unifex::on(scheduler), receiver{});
+
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+  tft.setTextSize(1);
+  tft.println("~ PPA! ~ particle_libunifex_v1_6EM");
+  tft.println("");
+  tft.print("Actual - Target (Speeds in m/sec)");
+  tft.setTextSize(2);
+
   static const bool started = (unifex::start(display_op), true);
 }
-
-unifex::manual_loop_context loop_context;
-unifex::interrupt_context irps_context;
 
 void runIrps() {
   static auto irps_op = unifex::connect(  
@@ -580,7 +617,7 @@ void runIrps() {
         // notify all irps of interrupt
         for (int i = 0; i < irpsCount; i++) {
           //call function to process IR interrupt
-          struct ir_event current_event = irps[i].handleStatus(irps_number);
+          struct ir_event current_event = irps[i].handleStatus(irps_number, now);
       
           // if a pulse is required, then send parameters to EM function
           if (current_event.irps_status == IRPSStatus::Exited && current_event.startTime > now ) {
@@ -595,8 +632,6 @@ void setup() {
 
   Serial.begin (115200);                      // start serial communication.
   // high baud rate required to send data in limited time
-
-  Serial.println("setup");
 
   pinMode(ir_interrupt, INPUT);
   pinMode(ir_add0, INPUT);
@@ -623,10 +658,8 @@ void setup() {
   tft.setRotation(3);
   tft.setTextWrap(false);
   tft.setAddrWindow(0, 0, tft.width(), tft.height());
-  display_main();
 
   irps_number = 0;
-  last_irps_number = 0;
 
   // reset all irps
   for (int i = 0; i < irpsCount; i++) {
@@ -643,48 +676,18 @@ void setup() {
 
   runDisplay(unifex::get_scheduler(timer));
 
-  runIrps();
+  runPid(unifex::get_scheduler(timer));
 
-  Serial.println("~setup");
+  runIrps();
 }
 
 //MAIN LOOP
 void loop() {
-//  wdt_enable(WDTO_500MS);
+  wdt_enable(WDTO_500MS);
 
-  static const bool looping = (Serial.println("first loop"), true);
-
-  auto& irps_ = active_irps();
-  auto& em_ = active_em();
-
-  if (irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
+  if (active_irps().get_status() != IRPSStatus::Exited || active_em().get_status() != EMStatus::Off) {
     return;
   }
 
   loop_context.run_once();
-
-  // update once after each EM pulse
-  if (last_irps_number != irps_.get_irps_number()) {
-    last_irps_number = irps_.get_irps_number();
-
-    float delta_time_us = irps_.get_delta_time_us();
-
-    if (delta_time_us > 0.0f) {
-      const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
-      const double output_mm = ppaPID.Run(speed) / 1000.0f;
-
-      irps_.set_pulse_dist_mm(output_mm);
-    }
-  }
 }   //end of main loop
-
-void display_main() {
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setCursor(0, 0);
-  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-  tft.setTextSize(1);
-  tft.println("~ PPA! ~ particle_pid_v1_6EM");
-  tft.println("");
-  tft.print("Actual - Target (Speeds in m/sec)");
-  tft.setTextSize(2);
-}
