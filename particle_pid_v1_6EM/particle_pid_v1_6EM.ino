@@ -674,8 +674,6 @@ auto runIrps() {
             irps[i].reset();
           }
         }
-
-        return current_event;
       });
 }
 
