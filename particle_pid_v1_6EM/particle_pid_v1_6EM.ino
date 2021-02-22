@@ -170,6 +170,7 @@ enum class IRPSStatus {
 struct ir_event {
   int irps_number;
   int em_number;
+  arduino_clock::time_point eventTime; // when the event occurred
   arduino_clock::time_point startTime; // when the EM is activated
   arduino_clock::time_point endTime;   // when the EM is deactivated
   String print_string;                 // the reporting string to be sent over USB
@@ -260,7 +261,7 @@ class IRPS
         if (send_to_print_stack_ == true) {
 //          report = "<";
         }
-        ir_event temp = {irps_number_ , em_number_, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when first beam has been broken
+        ir_event temp = {irps_number_ , em_number_, now, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when first beam has been broken
         return temp;
       }
 
@@ -280,7 +281,7 @@ class IRPS
           if (send_to_print_stack_ == true) {
             report = "r" + String(irps_number);
           }
-          ir_event temp = {irps_number_ , em_number_, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when resetting
+          ir_event temp = {irps_number_ , em_number_, now, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when resetting
           return temp;
         }
 
@@ -300,7 +301,7 @@ class IRPS
 //          report = String(irps_number_) + ", " + String(speed_, 2);
         }
 
-        ir_event temp = {irps_number_ , em_number_, start_time_, end_time_, report, irps_status_};
+        ir_event temp = {irps_number_ , em_number_, now, start_time_, end_time_, report, irps_status_};
         return temp;
       }
 
@@ -312,7 +313,7 @@ class IRPS
         report = "b" + String(irps_number) + "," + String(int(irps_status_));
       }
       reset();
-      ir_event temp = {irps_number_ , em_number_, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when
+      ir_event temp = {irps_number_ , em_number_, now, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when
       return temp;
     }
    
@@ -441,7 +442,7 @@ class EM
       digitalWrite(out_add1, em_number_ & 2);
       digitalWrite(out_add2, em_number_ & 4);
 
-      if (fire.startTime > unifex::get_scheduler(timer).now()) {
+      if (fire.startTime > fire.eventTime) {
         stopPulse();
         set_status(EMStatus::Pending);          // Set EM is in waiting period 
         //    Set up timer to wait for right time to start the pulse
