@@ -39,6 +39,61 @@ struct receiver {
   }
 };
 
+struct static_submit_sender_complete {
+  using type = static_submit_sender_complete;
+  using destruct_fn = void() noexcept;
+
+  destruct_fn* destruct_;
+
+  template <typename Index, typename... Values>
+  friend void tag_invoke(unifex::tag_t<unifex::set_index>, const type&, Index&&, Values&&...) noexcept {
+  }
+  friend void tag_invoke(unifex::tag_t<unifex::set_end>, type&&) noexcept {
+  }
+
+  template<typename... Vn>
+  friend void tag_invoke(unifex::tag_t<unifex::set_value>, type&&, Vn&&...) {
+  }
+
+  template<typename Error>
+  friend void tag_invoke(unifex::tag_t<unifex::set_error>, type&&, Error&& error) noexcept {
+  }
+  friend void tag_invoke(unifex::tag_t<unifex::set_done>, type&&) noexcept {
+  }
+  template <typename Cpo, typename... UVn>
+  friend void tag_invoke(unifex::tag_t<unifex::unwound>, const type& self, Cpo, UVn&&...) noexcept {
+    self.destruct_();
+  }
+
+};
+
+template<typename Sender>
+void static_submit(Sender sender) {
+  using sender_complete_t = static_submit_sender_complete;
+  using sender_operation_t = unifex::connect_result_t<Sender, sender_complete_t>;
+  using sender_op_storage_t = unifex::manual_lifetime<sender_operation_t>;
+
+  static bool started_ = false;
+  static sender_op_storage_t sender_op_;
+  struct destruct_fn {
+    static void destruct() noexcept {
+      sender_op_.destruct();
+      started_ = false;
+    }
+  };
+
+  assert(!started_);
+
+  sender_complete_t senderComplete{&destruct_fn::destruct};
+
+  auto& senderOp = sender_op_.construct_from([&]() noexcept {
+    return unifex::connect(std::move(sender), std::move(senderComplete));
+  });
+
+  started_ = true;
+  unifex::start(senderOp);
+}
+
 //********************** UNIFEX CONTEXTS ******************************
 unifex::manual_loop_context loop_context;
 unifex::interrupt_context irps_context;
@@ -116,17 +171,15 @@ double updateThrottle(const int pin) {
 }
 
 template<typename ATimeScheduler>
-void runThrottle(ATimeScheduler scheduler, const int pin) {
+auto runThrottle(ATimeScheduler scheduler, const int pin) {
   // update target_speed from throttle control.
-  static auto throttle_position_op = unifex::connect(  
-    unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(250)) 
+  return unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(250)) 
     | unifex::transform([pin](auto tick){
         const double target_speed = updateThrottle(pin);
         ppaPID.Setpoint(target_speed);
         return target_speed;
       }) 
-    | unifex::on(scheduler), receiver{});
-  static const bool started = (unifex::start(throttle_position_op), true);
+    | unifex::on(scheduler);
 }
 
 
@@ -495,16 +548,14 @@ static class EM& active_em() {
 }
 
 template<typename ATimeScheduler>
-void runPid(ATimeScheduler scheduler) {
-  static int xPos = 0;
+auto runPid(ATimeScheduler scheduler) {
   // update PID output.
-  static auto pid_op = unifex::connect(  
-    unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(47)) 
+  return unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(31)) 
     | unifex::transform([](auto tick){
         auto& irps_ = active_irps();
         auto& em_ = active_em();
   
-        if (irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
+        if (irps_.get_irps_number() == 0 || irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
           // do not update pid until after the active IRPS has measured the speed and the active EM has completed the pulse
           return;
         }
@@ -520,15 +571,22 @@ void runPid(ATimeScheduler scheduler) {
   
         irps_.set_pulse_dist_mm(output_mm);
       }) 
-    | unifex::on(scheduler), receiver{});
-  static const bool started = (unifex::start(pid_op), true);
+    | unifex::on(scheduler);
 }
 
 template<typename ATimeScheduler>
-void runDisplay(ATimeScheduler scheduler) {
+auto runDisplay(ATimeScheduler scheduler) {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+  tft.setTextSize(1);
+  tft.println("~ PPA! ~ particle_libunifex_v1_6EM");
+  tft.println("");
+  tft.print("Actual - Target (Speeds in m/sec)");
+  tft.setTextSize(2);
+
   // update display.
-  static auto display_op = unifex::connect(  
-    unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(33)) 
+  return unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(33)) 
     | unifex::transform([xPos = 0](auto tick) mutable {
 
         auto& irps_ = active_irps();
@@ -536,7 +594,7 @@ void runDisplay(ATimeScheduler scheduler) {
 
         auto tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tick.time_since_epoch());
 
-        if (irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
+        if (irps_.get_irps_number() == 0 || irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
           // do not draw until after the active IRPS has measured the speed and the active EM has completed the pulse
           return;
         }
@@ -586,24 +644,12 @@ void runDisplay(ATimeScheduler scheduler) {
         tft.print(" - ");
         tft.print((long)tick_ms.count());
       }) 
-    | unifex::on(scheduler), receiver{});
-
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setCursor(0, 0);
-  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-  tft.setTextSize(1);
-  tft.println("~ PPA! ~ particle_libunifex_v1_6EM");
-  tft.println("");
-  tft.print("Actual - Target (Speeds in m/sec)");
-  tft.setTextSize(2);
-
-  static const bool started = (unifex::start(display_op), true);
+    | unifex::on(scheduler);
 }
 
-void runIrps() {
-  static auto irps_op = unifex::connect(  
-    irps_context.all_interrupts()
-    | unifex::transform([](auto index){
+auto runIrps() {
+    return irps_context.all_interrupts()
+      | unifex::transform([](auto index){
         //demultiplexes hardware ir_interrupt and calls relevant Speed Sensor (IRPS) based on address
       
         irps_number = IRPS::readIrpsAddress();
@@ -615,18 +661,22 @@ void runIrps() {
       
         auto now = unifex::get_scheduler(timer).now();
       
-        // notify all irps of interrupt
+        struct ir_event current_event = irps[irps_number].handleStatus(irps_number, now);
+
+        // if a pulse is required, then send parameters to EM function
+        if (current_event.irps_status == IRPSStatus::Exited && current_event.startTime > now ) {
+          em[current_event.em_number].setup_timer(current_event);
+        }
+
+        // reset other irps
         for (int i = 0; i < irpsCount; i++) {
-          //call function to process IR interrupt
-          struct ir_event current_event = irps[i].handleStatus(irps_number, now);
-      
-          // if a pulse is required, then send parameters to EM function
-          if (current_event.irps_status == IRPSStatus::Exited && current_event.startTime > now ) {
-            em[current_event.em_number].setup_timer(current_event);
+          if (i != irps_number) {
+            irps[i].reset();
           }
         }
-      }), receiver{});
-  static const bool started = (unifex::start(irps_op), irps_context.attach(ir_interrupt, RISING), true);
+
+        return current_event;
+      });
 }
 
 void setup() {
@@ -673,20 +723,22 @@ void setup() {
     em[i].reset();
   }
 
-  runThrottle(unifex::get_scheduler(timer), thr);
+  static_submit(runThrottle(unifex::get_scheduler(timer), thr));
 
-  runDisplay(unifex::get_scheduler(timer));
+  static_submit(runDisplay(unifex::get_scheduler(timer)));
 
-  runPid(unifex::get_scheduler(timer));
+  static_submit(runPid(unifex::get_scheduler(timer)));
 
-  runIrps();
+  static_submit(runIrps());
+
+  irps_context.attach(ir_interrupt, RISING);
 }
 
 //MAIN LOOP
 void loop() {
   wdt_enable(WDTO_500MS);
 
-  if (active_irps().get_status() != IRPSStatus::Exited || active_em().get_status() != EMStatus::Off) {
+  if (active_irps().get_irps_number() == 0 || active_irps().get_status() != IRPSStatus::Exited || active_em().get_status() != EMStatus::Off) {
     return;
   }
 
