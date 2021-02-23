@@ -60,8 +60,13 @@ struct static_submit_sender_complete {
   }
   friend void tag_invoke(unifex::tag_t<unifex::set_done>, type&&) noexcept {
   }
+  template <typename... UVn>
+  friend void tag_invoke(unifex::tag_t<unifex::unwound>, const type&, unifex::tag_t<unifex::set_index>, UVn&&...) noexcept {
+    // non-terminating
+  }
   template <typename Cpo, typename... UVn>
   friend void tag_invoke(unifex::tag_t<unifex::unwound>, const type& self, Cpo, UVn&&...) noexcept {
+    // terminating
     self.destruct_();
   }
 
@@ -76,11 +81,18 @@ void static_submit(Sender sender) {
   static bool started_ = false;
   static sender_op_storage_t sender_op_;
   struct destruct_fn {
+    ~destruct_fn() {
+      // make sure that main does not exit before the sender is stopped.
+      assert(!started_);
+    }
     static void destruct() noexcept {
-      sender_op_.destruct();
-      started_ = false;
+      if (started_) {
+        sender_op_.destruct();
+        started_ = false;
+      }
     }
   };
+  static destruct_fn assert_state_;
 
   assert(!started_);
 
@@ -119,7 +131,7 @@ const float em_width_um = em_width_mm * 1000.0f;                         // a co
 const float em_center_mm = em_width_mm / 2.0f;                           // halfway through the EM
 const float em_center_um = em_center_mm * 1000.0f;                       // a convenient float version of em_center_mm to em_center_um (micrometers) to reduce calculation time
 
-const float max_pulse_dist_mm = 
+const float max_pulse_dist_mm =
   beam_center_mm + beam2em_dist_mm + em_center_mm;                       // all pulses will be relative to this max distance
 const float max_pulse_dist_um = max_pulse_dist_mm * 1000.0f;             // all pulses will be relative to this max distance
 
@@ -145,7 +157,7 @@ Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
 const float max_pid_em_output_um = max_pulse_dist_um * 0.6f;
 const float min_pid_em_output_um = 800.0f;
 // Ziegler–Nichols method for tuning PID
-double Ku = (max_pid_em_output_um * 0.50f) - min_pid_em_output_um, Tu = 2.00f; 
+double Ku = (max_pid_em_output_um * 0.50f) - min_pid_em_output_um, Tu = 2.00f;
 double Kp = (Ku * 0.60f), Ki = 1.2f * Ku / Tu, Kd = 3.0f * Ku * Tu / 40.00f;
 PID_v2 ppaPID(Kp, Ki, Kd, PID::Direct);
 //*********************************************************************
@@ -173,13 +185,13 @@ double updateThrottle(const int pin) {
 template<typename ATimeScheduler>
 auto runThrottle(ATimeScheduler scheduler, const int pin) {
   // update target_speed from throttle control.
-  return unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(250)) 
-    | unifex::transform([pin](auto tick){
-        const double target_speed = updateThrottle(pin);
-        ppaPID.Setpoint(target_speed);
-        return target_speed;
-      }) 
-    | unifex::on(scheduler);
+  return unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(250))
+  | unifex::transform([pin](auto tick) {
+    const double target_speed = updateThrottle(pin);
+    ppaPID.Setpoint(target_speed);
+    return target_speed;
+  })
+  | unifex::on(scheduler);
 }
 
 
@@ -216,7 +228,7 @@ const int thr           = A4;
 enum class IRPSStatus {
   Ready = 0,
   Entered = 1,
-  Exited = 2 
+  Exited = 2
 };
 
 // The main structure to hold an upcoming EM activation
@@ -278,7 +290,7 @@ class IRPS
     void set_pulse_dist_mm(int pulse_mm) {
       pulse_dist_mm_ = std::min(pulse_mm, max_dist_mm_);
     }
-    
+
     IRPSStatus get_status() {
       return irps_status_;
     }
@@ -290,13 +302,13 @@ class IRPS
     int get_em_number() {
       return em_number_;
     }
-    
+
     // microseconds between first and second beam breaks
     arduino_clicks get_delta_time() {
       if (irps_status_ == IRPSStatus::Exited && s1_ != arduino_clock::time_point{} && s2_ != arduino_clock::time_point{}) {
         return s2_ - s1_;
       }
-      return arduino_clicks{-1.0f}; // invalid
+      return arduino_clicks{ -1.0f}; // invalid
     }
     float get_delta_time_us() {
       return std::chrono::duration_cast<std::chrono::microseconds>(get_delta_time()).count();
@@ -312,7 +324,7 @@ class IRPS
         irps_status_ = IRPSStatus::Entered;        // update status to show first beam break
         String report;                             // hold data for printing
         if (send_to_print_stack_ == true) {
-//          report = "<";
+          //          report = "<";
         }
         ir_event temp = {irps_number_ , em_number_, now, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when first beam has been broken
         return temp;
@@ -350,8 +362,8 @@ class IRPS
         String report;          // hold data for printing
         if (send_to_print_stack_ == true) {
           //     the following calculation could be moved out of interrupt time
-//          float speed_ = (float)interbeam_dist_mm / (delta_time_us_ / 1000.0f);   //calculate speed as float for reporting
-//          report = String(irps_number_) + ", " + String(speed_, 2);
+          //          float speed_ = (float)interbeam_dist_mm / (delta_time_us_ / 1000.0f);   //calculate speed as float for reporting
+          //          report = String(irps_number_) + ", " + String(speed_, 2);
         }
 
         ir_event temp = {irps_number_ , em_number_, now, start_time_, end_time_, report, irps_status_};
@@ -361,7 +373,7 @@ class IRPS
       // reset
       String report;          // hold data for printing
       if (send_to_print_stack_ == true && irps_number_ == irps_number) {
-        // only report invalid events that are targeted to this irps - other 
+        // only report invalid events that are targeted to this irps - other
         // events are valid resets for this irps
         report = "b" + String(irps_number) + "," + String(int(irps_status_));
       }
@@ -369,7 +381,7 @@ class IRPS
       ir_event temp = {irps_number_ , em_number_, now, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when
       return temp;
     }
-   
+
 };
 
 //Intialise Infra-Red Position Sensors and ElectroMagnets
@@ -390,13 +402,13 @@ IRPS irps[] = {
 const int irpsCount = sizeof(irps) / sizeof(IRPS);
 
 static class IRPS& active_irps() {
-  return irps[irps_number];
+    return irps[irps_number];
 }
 
 enum class EMStatus {
   Off = 0,
   Pending = 1,
-  On = 2 
+  On = 2
 };
 
 class EM
@@ -408,11 +420,11 @@ class EM
       auto& get_timer_op() {
         return em_.timer_op_;
       }
-    
+
       template<typename... Vn>
       friend void tag_invoke(unifex::tag_t<unifex::set_value>, timer_complete&& self, Vn&&...) {
         timer_complete next{std::move(self)};
-        
+
         next.get_timer_op().destruct();
 
         if (next.em_.get_status() == EMStatus::Pending) {
@@ -420,9 +432,9 @@ class EM
         }
         else if (next.em_.get_status() == EMStatus::On) {
           next.em_.stopPulse();
-        } 
+        }
       }
-    
+
       template<typename Error>
       friend void tag_invoke(unifex::tag_t<unifex::set_error>, timer_complete&& self, Error&& error) noexcept {
         self.em_.stopPulse();
@@ -440,10 +452,10 @@ class EM
     EMStatus status_;       // EM - pending, on, off
     unsigned long safetime_;    // the maximum allowed pulse duration
     unifex::manual_lifetime<unifex::connect_result_t<
-      unifex::schedule_at_result_t<std::decay_t<
-        unifex::get_scheduler_result_t<unifex::timer_context&>>&,
-          const typename arduino_clock::time_point&>,
-      timer_complete>> timer_op_;
+    unifex::schedule_at_result_t<std::decay_t<
+    unifex::get_scheduler_result_t<unifex::timer_context&>>&,
+           const typename arduino_clock::time_point&>,
+           timer_complete>> timer_op_;
 
     // These maintain the current state
     // Constructor - creates an EM
@@ -488,8 +500,8 @@ class EM
       pulseTime_ = fire.endTime;
 
 
-//      digitalWrite(scope0_toggle, LOW);     // display wait period start on scope
-      
+      //      digitalWrite(scope0_toggle, LOW);     // display wait period start on scope
+
       //    write EM output address prior to energising output line
       digitalWrite(out_add0, em_number_ & 1);
       digitalWrite(out_add1, em_number_ & 2);
@@ -497,7 +509,7 @@ class EM
 
       if (fire.startTime > fire.eventTime) {
         stopPulse();
-        set_status(EMStatus::Pending);          // Set EM is in waiting period 
+        set_status(EMStatus::Pending);          // Set EM is in waiting period
         //    Set up timer to wait for right time to start the pulse
         auto& timerOp = timer_op_.construct_from([&, this]() noexcept {
           return unifex::connect(unifex::schedule_at(unifex::get_scheduler(timer), fire.startTime), timer_complete{*this, fire});
@@ -509,7 +521,7 @@ class EM
     }
 
     void startPulse(ir_event fire) {
-//    digitalWrite(scope0_toggle, HIGH);    // display wait period end on scope
+      //    digitalWrite(scope0_toggle, HIGH);    // display wait period end on scope
 
       digitalWrite(out_flag, EM_ACTIVE);    // enable the EM
       set_status(EMStatus::On);             // Set EM is now energised
@@ -544,34 +556,34 @@ EM em[] = {
 const int emCount = sizeof(em) / sizeof(EM);
 
 static class EM& active_em() {
-  return em[active_irps().get_em_number()];
+    return em[active_irps().get_em_number()];
 }
 
 template<typename ATimeScheduler>
 auto runPid(ATimeScheduler scheduler) {
   // update PID output.
-  return unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(31)) 
-    | unifex::transform([](auto tick){
-        auto& irps_ = active_irps();
-        auto& em_ = active_em();
-  
-        if (irps_.get_irps_number() == 0 || irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
-          // do not update pid until after the active IRPS has measured the speed and the active EM has completed the pulse
-          return;
-        }
-  
-        const float delta_time_us = irps_.get_delta_time_us();
-        if (delta_time_us <= 0.0f) {
-          // only update with valid data
-          return;
-        }
-  
-        const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
-        const double output_mm = ppaPID.Run(speed) / 1000.0f;
-  
-        irps_.set_pulse_dist_mm(output_mm);
-      }) 
-    | unifex::on(scheduler);
+  return unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(31))
+  | unifex::transform([](auto tick) {
+    auto& irps_ = active_irps();
+    auto& em_ = active_em();
+
+    if (irps_.get_irps_number() == 0 || irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
+      // do not update pid until after the active IRPS has measured the speed and the active EM has completed the pulse
+      return;
+    }
+
+    const float delta_time_us = irps_.get_delta_time_us();
+    if (delta_time_us <= 0.0f) {
+      // only update with valid data
+      return;
+    }
+
+    const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
+    const double output_mm = ppaPID.Run(speed) / 1000.0f;
+
+    irps_.set_pulse_dist_mm(output_mm);
+  })
+  | unifex::on(scheduler);
 }
 
 template<typename ATimeScheduler>
@@ -586,95 +598,95 @@ auto runDisplay(ATimeScheduler scheduler) {
   tft.setTextSize(2);
 
   // update display.
-  return unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(33)) 
-    | unifex::transform([xPos = 0](auto tick) mutable {
+  return unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(33))
+  | unifex::transform([xPos = 0](auto tick) mutable {
 
-        auto& irps_ = active_irps();
-        auto& em_ = active_em();
+    auto& irps_ = active_irps();
+    auto& em_ = active_em();
 
-        auto tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tick.time_since_epoch());
+    auto tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tick.time_since_epoch());
 
-        if (irps_.get_irps_number() == 0 || irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
-          // do not draw until after the active IRPS has measured the speed and the active EM has completed the pulse
-          return;
-        }
+    if (irps_.get_irps_number() == 0 || irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
+      // do not draw until after the active IRPS has measured the speed and the active EM has completed the pulse
+      return;
+    }
 
-        const float delta_time_us = irps_.get_delta_time_us();
-        if (delta_time_us <= 0.0f) {
-          // only draw valid data
-          return;
-        }
+    const float delta_time_us = irps_.get_delta_time_us();
+    if (delta_time_us <= 0.0f) {
+      // only draw valid data
+      return;
+    }
 
-        constexpr auto sixty_seconds = 60'000;
-        const auto xPos_ = map(tick_ms.count() % sixty_seconds, 0, sixty_seconds, 0, tft.width());  // scale actual speed according to graph area on scale for plotting purposes
+    constexpr auto sixty_seconds = 60'000;
+    const auto xPos_ = map(tick_ms.count() % sixty_seconds, 0, sixty_seconds, 0, tft.width());  // scale actual speed according to graph area on scale for plotting purposes
 
-        if (xPos == xPos_) {
-          // only draw once per unique pixel
-          return;
-        }
-        xPos = xPos_;
+    if (xPos == xPos_) {
+      // only draw once per unique pixel
+      return;
+    }
+    xPos = xPos_;
 
-        const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
+    const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
 
-        const double target_speed = ppaPID.GetSetpoint();
+    const double target_speed = ppaPID.GetSetpoint();
 
-        const auto yPos = map(speed * 100, 0, 1000, tft.height(), 52);  // scale actual speed according to graph area on scale for plotting purposes
-        const auto yTargetPos = map(target_speed * 100, 0, 1000, tft.height(), 52);  // scale target speed according to graph area on scale for plotting purposes
+    const auto yPos = map(speed * 100, 0, 1000, tft.height(), 52);  // scale actual speed according to graph area on scale for plotting purposes
+    const auto yTargetPos = map(target_speed * 100, 0, 1000, tft.height(), 52);  // scale target speed according to graph area on scale for plotting purposes
 
-        // clear next line
-        tft.drawFastVLine(xPos_, 52, tft.height() - 52, ILI9341_BLACK);
-        tft.drawFastVLine(xPos_ + 1, 52, tft.height() - 52, ILI9341_BLACK);
-        tft.drawFastVLine(xPos_ + 2, 52, tft.height() - 52, ILI9341_BLACK);
+    // clear next line
+    tft.drawFastVLine(xPos_, 52, tft.height() - 52, ILI9341_BLACK);
+    tft.drawFastVLine(xPos_ + 1, 52, tft.height() - 52, ILI9341_BLACK);
+    tft.drawFastVLine(xPos_ + 2, 52, tft.height() - 52, ILI9341_BLACK);
 
-        // indicator for current position
-        tft.drawFastHLine(0, tft.height() - 2, tft.width(), ILI9341_BLACK);
-        tft.drawFastHLine(0, tft.height() - 1, tft.width(), ILI9341_BLACK);
-        tft.drawFastVLine( xPos_, tft.height() - 2, 2, ILI9341_GREEN );
+    // indicator for current position
+    tft.drawFastHLine(0, tft.height() - 2, tft.width(), ILI9341_BLACK);
+    tft.drawFastHLine(0, tft.height() - 1, tft.width(), ILI9341_BLACK);
+    tft.drawFastVLine( xPos_, tft.height() - 2, 2, ILI9341_GREEN );
 
-        // actual speed
-        tft.drawFastVLine( xPos_, yPos, 2, ILI9341_WHITE );
+    // actual speed
+    tft.drawFastVLine( xPos_, yPos, 2, ILI9341_WHITE );
 
-        // target speed
-        tft.drawPixel( xPos_, yTargetPos, ILI9341_RED );
-  
-        tft.setCursor(0, 35);
-        tft.print(speed, 2);
-        tft.print(" - ");
-        tft.print(target_speed, 2);
-        tft.print(" - ");
-        tft.print((long)tick_ms.count());
-      }) 
-    | unifex::on(scheduler);
+    // target speed
+    tft.drawPixel( xPos_, yTargetPos, ILI9341_RED );
+
+    tft.setCursor(0, 35);
+    tft.print(speed, 2);
+    tft.print(" - ");
+    tft.print(target_speed, 2);
+    tft.print(" - ");
+    tft.print((long)tick_ms.count());
+  })
+  | unifex::on(scheduler);
 }
 
 auto runIrps() {
     return irps_context.all_interrupts()
-      | unifex::transform([](auto index){
-        //demultiplexes hardware ir_interrupt and calls relevant Speed Sensor (IRPS) based on address
-      
-        irps_number = IRPS::readIrpsAddress();
-      
-        if (irps_number < 0 || irps_number >= irpsCount) {
-          irps_number = 0;
-          return;
-        }
-      
-        auto now = unifex::get_scheduler(timer).now();
-      
-        struct ir_event current_event = irps[irps_number].handleStatus(irps_number, now);
+    | unifex::transform([](auto index){
+    //demultiplexes hardware ir_interrupt and calls relevant Speed Sensor (IRPS) based on address
 
-        // if a pulse is required, then send parameters to EM function
-        if (current_event.irps_status == IRPSStatus::Exited && current_event.startTime > now ) {
-          em[current_event.em_number].setup_timer(current_event);
-        }
+    irps_number = IRPS::readIrpsAddress();
 
-        // reset other irps
-        for (int i = 0; i < irpsCount; i++) {
-          if (i != irps_number) {
-            irps[i].reset();
-          }
-        }
-      });
+    if (irps_number < 0 || irps_number >= irpsCount) {
+      irps_number = 0;
+      return;
+    }
+
+    auto now = unifex::get_scheduler(timer).now();
+
+    struct ir_event current_event = irps[irps_number].handleStatus(irps_number, now);
+
+    // if a pulse is required, then send parameters to EM function
+    if (current_event.irps_status == IRPSStatus::Exited && current_event.startTime > now ) {
+      em[current_event.em_number].setup_timer(current_event);
+    }
+
+    // reset other irps
+    for (int i = 0; i < irpsCount; i++) {
+      if (i != irps_number) {
+        irps[i].reset();
+      }
+    }
+  });
 }
 
 void setup() {
@@ -694,13 +706,13 @@ void setup() {
   pinMode(display_cs, OUTPUT);
   pinMode(display_sda, OUTPUT);
   pinMode(display_sc, INPUT);
-//  pinMode(scope0_toggle, OUTPUT);
+  //  pinMode(scope0_toggle, OUTPUT);
 
-//  digitalWrite(scope0_toggle, LOW);       // initialise with turned off value
+  //  digitalWrite(scope0_toggle, LOW);       // initialise with turned off value
   digitalWrite(out_flag, EM_DISABLE);       // initialise with turned off value
 
   ppaPID.SetOutputLimits(min_pid_em_output_um, max_pid_em_output_um); // PID is used to modulate how long the pulse is in micrometers
-  ppaPID.Start(0.0f, 0.0f, updateThrottle(thr));       // 
+  ppaPID.Start(0.0f, 0.0f, updateThrottle(thr));       //
 
   //SCREEN
   tft.begin();
