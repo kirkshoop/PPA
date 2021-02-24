@@ -17,8 +17,6 @@
 
 #include <cassert>
 #include <type_traits>
-
-#undef abs
 #include <chrono>
 
 #include <unifex/config.hpp>
@@ -27,6 +25,8 @@
 #include <unifex/receiver_concepts.hpp>
 #include <unifex/scheduler_concepts.hpp>
 #include <unifex/stop_token_concepts.hpp>
+
+#include "sequence.hpp"
 
 #include <unifex/detail/prologue.hpp>
 
@@ -111,13 +111,29 @@ namespace _timer_context {
   template <typename Duration, typename Receiver>
   struct _after_op {
     class type;
+    class unwinder;
   };
   template <typename Duration, typename Receiver>
   using after_operation =
       typename _after_op<Duration, remove_cvref_t<Receiver>>::type;
 
   template <typename Duration, typename Receiver>
+  struct _after_op<Duration, Receiver>::unwinder {
+    using op_t = typename _after_op<Duration, Receiver>::type;
+    op_t* op_;
+    Receiver& get_receiver() {
+      return op_->receiver_;
+    } 
+    template <typename Cpo, typename... Vn>
+    friend void tag_invoke(unifex::tag_t<unifex::unwind>, unwinder& self, Cpo cpo, Vn&&... vn) noexcept {
+      unifex::unwound(self.get_receiver(), cpo, (Vn&&) vn...);
+    }
+  };
+
+  template <typename Duration, typename Receiver>
   class _after_op<Duration, Receiver>::type final : task_base {
+    using unwinder_t = typename _after_op<Duration, Receiver>::unwinder;
+    friend class _after_op<Duration, Receiver>::unwinder;
     friend schedule_after_sender<Duration>;
 
     template <typename Receiver2>
@@ -153,6 +169,14 @@ namespace _timer_context {
         cancelCallback_;
 
    public:
+
+    friend unwinder_t tag_invoke(unifex::tag_t<unifex::get_unwinder>, const type& self) noexcept {
+      return unwinder_t{const_cast<type*>(&self)};
+    }
+
+    friend void tag_invoke(unifex::tag_t<unifex::step>, type&) noexcept {
+    }
+
     void start() noexcept;
   };
 
@@ -189,12 +213,29 @@ namespace _timer_context {
   template <typename Receiver>
   struct _at_op {
     class type;
+    class unwinder;
   };
   template <typename Receiver>
   using at_operation = typename _at_op<remove_cvref_t<Receiver>>::type;
 
+  template<typename Receiver>
+  struct _at_op<Receiver>::unwinder {
+    using op_t = typename _at_op<Receiver>::type;
+    op_t* op_;
+    Receiver& get_receiver() {
+      return op_->receiver_;
+    } 
+    template <typename Cpo, typename... Vn>
+    friend void tag_invoke(unifex::tag_t<unifex::unwind>, unwinder& self, Cpo cpo, Vn&&... vn) noexcept {
+      unifex::unwound(self.get_receiver(), cpo, (Vn&&) vn...);
+    }
+  };
+
   template <typename Receiver>
   class _at_op<Receiver>::type final : task_base {
+    using unwinder_t = typename _at_op<Receiver>::unwinder;
+    friend class _at_op<Receiver>::unwinder;
+
     static void execute_impl(task_base* p) noexcept {
       auto& self = *static_cast<type*>(p);
       self.cancelCallback_.destruct();
@@ -224,6 +265,13 @@ namespace _timer_context {
         : task_base(scheduler, &type::execute_impl)
         , receiver_((Receiver2 &&) receiver) {
       this->dueTime_ = dueTime;
+    }
+
+    friend unwinder_t tag_invoke(unifex::tag_t<unifex::get_unwinder>, const type& self) noexcept {
+      return unwinder_t{const_cast<type*>(&self)};
+    }
+
+    friend void tag_invoke(unifex::tag_t<unifex::step>, type&) noexcept {
     }
 
     void start() noexcept;

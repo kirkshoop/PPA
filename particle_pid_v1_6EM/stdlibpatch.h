@@ -3,7 +3,35 @@
 #undef round
 #undef abs
 
+#include <ratio>
+#undef min
+#undef max
+#undef round
+#undef abs
+
 #include <type_traits>
+#undef min
+#undef max
+#undef round
+#undef abs
+
+#include <limits>
+#undef min
+#undef max
+#undef round
+#undef abs
+
+#include <ctime>
+#undef min
+#undef max
+#undef round
+#undef abs
+
+#include <chrono>
+#undef min
+#undef max
+#undef round
+#undef abs
 
 namespace std {
   template<typename T>

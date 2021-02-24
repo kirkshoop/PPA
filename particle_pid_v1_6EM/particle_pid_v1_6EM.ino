@@ -15,96 +15,9 @@
 #include "timer_context.hpp"
 #include "interrupt_context.hpp"
 #include "sequence.hpp"
+#include "static_submit.hpp"
 #include <unifex/just.hpp>
 #include <unifex/on.hpp>
-
-struct receiver {
-  template <typename Index, typename... Values>
-  friend void tag_invoke(unifex::tag_t<unifex::set_index>, const receiver&, Index&&, Values&&...) noexcept {
-  }
-  friend void tag_invoke(unifex::tag_t<unifex::set_end>, receiver&&) noexcept {
-  }
-
-  template<typename... Vn>
-  friend void tag_invoke(unifex::tag_t<unifex::set_value>, receiver&&, Vn&&...) {
-  }
-
-  template<typename Error>
-  friend void tag_invoke(unifex::tag_t<unifex::set_error>, receiver&&, Error&& error) noexcept {
-  }
-  friend void tag_invoke(unifex::tag_t<unifex::set_done>, receiver&&) noexcept {
-  }
-  template <typename Cpo, typename... UVn>
-  friend void tag_invoke(unifex::tag_t<unifex::unwound>, const receiver&, Cpo, UVn&&...) noexcept {
-  }
-};
-
-struct static_submit_sender_complete {
-  using type = static_submit_sender_complete;
-  using destruct_fn = void() noexcept;
-
-  destruct_fn* destruct_;
-
-  template <typename Index, typename... Values>
-  friend void tag_invoke(unifex::tag_t<unifex::set_index>, const type&, Index&&, Values&&...) noexcept {
-  }
-  friend void tag_invoke(unifex::tag_t<unifex::set_end>, type&&) noexcept {
-  }
-
-  template<typename... Vn>
-  friend void tag_invoke(unifex::tag_t<unifex::set_value>, type&&, Vn&&...) {
-  }
-
-  template<typename Error>
-  friend void tag_invoke(unifex::tag_t<unifex::set_error>, type&&, Error&& error) noexcept {
-  }
-  friend void tag_invoke(unifex::tag_t<unifex::set_done>, type&&) noexcept {
-  }
-  template <typename... UVn>
-  friend void tag_invoke(unifex::tag_t<unifex::unwound>, const type&, unifex::tag_t<unifex::set_index>, UVn&&...) noexcept {
-    // non-terminating
-  }
-  template <typename Cpo, typename... UVn>
-  friend void tag_invoke(unifex::tag_t<unifex::unwound>, const type& self, Cpo, UVn&&...) noexcept {
-    // terminating
-    self.destruct_();
-  }
-
-};
-
-template<typename Sender>
-void static_submit(Sender sender) {
-  using sender_complete_t = static_submit_sender_complete;
-  using sender_operation_t = unifex::connect_result_t<Sender, sender_complete_t>;
-  using sender_op_storage_t = unifex::manual_lifetime<sender_operation_t>;
-
-  static bool started_ = false;
-  static sender_op_storage_t sender_op_;
-  struct destruct_fn {
-    ~destruct_fn() {
-      // make sure that main does not exit before the sender is stopped.
-      assert(!started_);
-    }
-    static void destruct() noexcept {
-      if (started_) {
-        sender_op_.destruct();
-        started_ = false;
-      }
-    }
-  };
-  static destruct_fn assert_state_;
-
-  assert(!started_);
-
-  sender_complete_t senderComplete{&destruct_fn::destruct};
-
-  auto& senderOp = sender_op_.construct_from([&]() noexcept {
-    return unifex::connect(std::move(sender), std::move(senderComplete));
-  });
-
-  started_ = true;
-  unifex::start(senderOp);
-}
 
 //********************** UNIFEX CONTEXTS ******************************
 unifex::manual_loop_context loop_context;
@@ -136,7 +49,7 @@ const float max_pulse_dist_mm =
 const float max_pulse_dist_um = max_pulse_dist_mm * 1000.0f;             // all pulses will be relative to this max distance
 
 const float min_speed_mps = 1.8f; // slowest speed physically maintainable
-const float max_speed_mps = 8.0f; // highest speed physically attainable
+const float max_speed_mps = 6.0f; // highest speed physically attainable
 
 //*********************************************************************
 
@@ -238,8 +151,9 @@ struct ir_event {
   arduino_clock::time_point eventTime; // when the event occurred
   arduino_clock::time_point startTime; // when the EM is activated
   arduino_clock::time_point endTime;   // when the EM is deactivated
-  String print_string;                 // the reporting string to be sent over USB
+//  String print_string;                 // the reporting string to be sent over USB
   IRPSStatus irps_status;              // indicates prior first beam break (0), after first beam break (1), and after second beam break (2)
+  float speed;
 };
 
 //Infra-Red Position Sensor (IRPS)
@@ -322,11 +236,11 @@ class IRPS
       if (irps_number == irps_number_ && irps_status_ == IRPSStatus::Ready && s1_ == arduino_clock::time_point{} && s2_ == arduino_clock::time_point{}) {
         s1_ = now;                                 // record beam break time
         irps_status_ = IRPSStatus::Entered;        // update status to show first beam break
-        String report;                             // hold data for printing
-        if (send_to_print_stack_ == true) {
-          //          report = "<";
-        }
-        ir_event temp = {irps_number_ , em_number_, now, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when first beam has been broken
+//        String report;                             // hold data for printing
+//        if (send_to_print_stack_ == true) {
+//          report = "Entered IRPS";
+//        }
+        ir_event temp = {irps_number_ , em_number_, now, now, now, /*report,*/ irps_status_, 0.0f};  // return IRPS and EM, no need to return wait, pulse or report when first beam has been broken
         return temp;
       }
 
@@ -342,11 +256,11 @@ class IRPS
         // reset when irps measurment invalid
         if (delta_clicks_.count() < 0.0f) {
           reset();
-          String report;          // hold data for printing
-          if (send_to_print_stack_ == true) {
-            report = "r" + String(irps_number);
-          }
-          ir_event temp = {irps_number_ , em_number_, now, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when resetting
+//          String report;          // hold data for printing
+//          if (send_to_print_stack_ == true) {
+//            report = "invalid delta";
+//          }
+          ir_event temp = {irps_number_ , em_number_, now, now, now, /*report,*/ irps_status_, 0.0f};  // return IRPS and EM, no need to return wait, pulse or report when resetting
           return temp;
         }
 
@@ -354,31 +268,32 @@ class IRPS
         arduino_clock::time_point end_time_;
 
         //  if the electromagnet is enabled for pulsing, calculate required timing
-        if (enabled_ && pulse_dist_mm_ < max_dist_mm_) {
+        if (enabled_ && pulse_dist_mm_ <= max_dist_mm_) {
           start_time_ = s2_ + std::min(clicks_mm_ * (max_dist_mm_ - pulse_dist_mm_) * 1.00f, arduino::max_clicks);   // when EM pulse starts
           end_time_ = s2_ + std::min(clicks_mm_ * max_dist_mm_ * 1.0f, arduino::max_clicks);                        // when EM pulse ends
         }
 
-        String report;          // hold data for printing
-        if (send_to_print_stack_ == true) {
-          //     the following calculation could be moved out of interrupt time
-          //          float speed_ = (float)interbeam_dist_mm / (delta_time_us_ / 1000.0f);   //calculate speed as float for reporting
-          //          report = String(irps_number_) + ", " + String(speed_, 2);
-        }
+        constexpr auto clicks_per_second = std::chrono::duration_cast<arduino_clicks>(std::chrono::seconds(1));
+        float meters_per_second_ = clicks_per_second / (clicks_mm_ * 1000.0f);   //calculate speed as float for reporting
 
-        ir_event temp = {irps_number_ , em_number_, now, start_time_, end_time_, report, irps_status_};
+//        String report;          // hold data for printing
+//        if (send_to_print_stack_ == true) {
+//          report = "Exited IRPS";
+//        }
+
+        ir_event temp = {irps_number_ , em_number_, now, start_time_, end_time_, /*report,*/ irps_status_, meters_per_second_};
         return temp;
       }
 
       // reset
-      String report;          // hold data for printing
-      if (send_to_print_stack_ == true && irps_number_ == irps_number) {
-        // only report invalid events that are targeted to this irps - other
-        // events are valid resets for this irps
-        report = "b" + String(irps_number) + "," + String(int(irps_status_));
-      }
+//      String report;          // hold data for printing
+//      if (send_to_print_stack_ == true && irps_number_ == irps_number) {
+//        // only report invalid events that are targeted to this irps - other
+//        // events are valid resets for this irps
+//        report = "invalid state";
+//      }
       reset();
-      ir_event temp = {irps_number_ , em_number_, now, arduino_clock::time_point{}, arduino_clock::time_point{}, report, irps_status_};  // return IRPS and EM, no need to return wait, pulse or report when
+      ir_event temp = {irps_number_ , em_number_, now, now, now, /*report,*/ irps_status_, 0.0f};  // return IRPS and EM, no need to return wait, pulse or report when
       return temp;
     }
 
@@ -393,16 +308,16 @@ IRPS irps[] = {
   IRPS(1, 0, true, interbeam_dist_mm, max_pulse_dist_mm, true),
   IRPS(2, 2, true, interbeam_dist_mm, max_pulse_dist_mm, true),
   IRPS(3, 1, true, interbeam_dist_mm, max_pulse_dist_mm, true),
-  IRPS(4, 4, true, interbeam_dist_mm, max_pulse_dist_mm, false),
-  IRPS(5, 5, true, interbeam_dist_mm, max_pulse_dist_mm, false),
-  IRPS(6, 3, true, interbeam_dist_mm, max_pulse_dist_mm, false)
+//  IRPS(4, 4, true, interbeam_dist_mm, max_pulse_dist_mm, false),
+//  IRPS(5, 5, true, interbeam_dist_mm, max_pulse_dist_mm, false),
+//  IRPS(6, 3, true, interbeam_dist_mm, max_pulse_dist_mm, false)
 };
 //~,1,0,2,4,5,3
 //***************************************************************************************
 const int irpsCount = sizeof(irps) / sizeof(IRPS);
 
 static class IRPS& active_irps() {
-    return irps[irps_number];
+  return irps[irps_number];
 }
 
 enum class EMStatus {
@@ -548,9 +463,9 @@ EM em[] = {
   EM(0, true, em_max_safe_clicks),
   EM(1, true, em_max_safe_clicks),
   EM(2, true, em_max_safe_clicks),
-  EM(3, true, em_max_safe_clicks),
-  EM(4, true, em_max_safe_clicks),
-  EM(5, true, em_max_safe_clicks),
+//  EM(3, true, em_max_safe_clicks),
+//  EM(4, true, em_max_safe_clicks),
+//  EM(5, true, em_max_safe_clicks),
 };
 //***************************************************************************************
 const int emCount = sizeof(em) / sizeof(EM);
@@ -559,134 +474,161 @@ static class EM& active_em() {
     return em[active_irps().get_em_number()];
 }
 
-template<typename ATimeScheduler>
-auto runPid(ATimeScheduler scheduler) {
-  // update PID output.
-  return unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(31))
-  | unifex::transform([](auto tick) {
-    auto& irps_ = active_irps();
-    auto& em_ = active_em();
+double updatePID(const struct ir_event& current_event) {
+  const double output_mm = ppaPID.Run(current_event.speed) / 1000.0f;
 
-    if (irps_.get_irps_number() == 0 || irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
-      // do not update pid until after the active IRPS has measured the speed and the active EM has completed the pulse
-      return;
-    }
+  for (int irpsIndex = 0; irpsIndex < irpsCount; ++irpsIndex) {
+    irps[irpsIndex].set_pulse_dist_mm(output_mm);
+  }
 
-    const float delta_time_us = irps_.get_delta_time_us();
-    if (delta_time_us <= 0.0f) {
-      // only update with valid data
-      return;
-    }
-
-    const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
-    const double output_mm = ppaPID.Run(speed) / 1000.0f;
-
-    irps_.set_pulse_dist_mm(output_mm);
-  })
-  | unifex::on(scheduler);
+  return output_mm;
 }
 
-template<typename ATimeScheduler>
-auto runDisplay(ATimeScheduler scheduler) {
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setCursor(0, 0);
-  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-  tft.setTextSize(1);
-  tft.println("~ PPA! ~ particle_libunifex_v1_6EM");
-  tft.println("");
-  tft.print("Actual - Target (Speeds in m/sec)");
-  tft.setTextSize(2);
+void drawEvent(unifex::timer_context::time_point now, const struct ir_event& current_event) {
+  const auto tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(current_event.eventTime.time_since_epoch());
+  const double target_speed = ppaPID.GetSetpoint();
 
-  // update display.
-  return unifex::interval(scheduler.now() + std::chrono::milliseconds(200), std::chrono::milliseconds(33))
-  | unifex::transform([xPos = 0](auto tick) mutable {
+  constexpr auto sixty_seconds = 60'000;
+  const auto xPos_ = map(tick_ms.count() % sixty_seconds, 0, sixty_seconds, 0, tft.width());  // scale time according to graph area on scale for plotting purposes
+  const auto yPos = map(current_event.speed * 100, 0, 800, tft.height(), 52);  // scale actual speed according to graph area on scale for plotting purposes
+  const auto yTargetPos = map(target_speed * 100, 0, 800, tft.height(), 52);  // scale target speed according to graph area on scale for plotting purposes
 
-    auto& irps_ = active_irps();
-    auto& em_ = active_em();
+  // clear next line
+  tft.drawFastVLine(xPos_, 52, tft.height() - 52, ILI9341_BLACK);
+  tft.drawFastVLine(xPos_ + 1, 52, tft.height() - 52, ILI9341_BLACK);
+  tft.drawFastVLine(xPos_ + 2, 52, tft.height() - 52, ILI9341_BLACK);
 
-    auto tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tick.time_since_epoch());
+  // indicator for current position
+  tft.drawFastHLine(0, tft.height() - 2, tft.width(), ILI9341_BLACK);
+  tft.drawFastHLine(0, tft.height() - 1, tft.width(), ILI9341_BLACK);
+  tft.drawFastVLine( xPos_, tft.height() - 2, 2, ILI9341_GREEN );
 
-    if (irps_.get_irps_number() == 0 || irps_.get_status() != IRPSStatus::Exited || em_.get_status() != EMStatus::Off) {
-      // do not draw until after the active IRPS has measured the speed and the active EM has completed the pulse
-      return;
-    }
+  // actual speed
+  tft.drawFastVLine( xPos_, yPos, 2, ILI9341_WHITE );
 
-    const float delta_time_us = irps_.get_delta_time_us();
-    if (delta_time_us <= 0.0f) {
-      // only draw valid data
-      return;
-    }
+  // target speed
+  tft.drawPixel( xPos_, yTargetPos, ILI9341_RED );
 
-    constexpr auto sixty_seconds = 60'000;
-    const auto xPos_ = map(tick_ms.count() % sixty_seconds, 0, sixty_seconds, 0, tft.width());  // scale actual speed according to graph area on scale for plotting purposes
-
-    if (xPos == xPos_) {
-      // only draw once per unique pixel
-      return;
-    }
-    xPos = xPos_;
-
-    const double speed = interbeam_dist_um / delta_time_us;  // micrometers divided by microseconds is equivalent to metres per second
-
-    const double target_speed = ppaPID.GetSetpoint();
-
-    const auto yPos = map(speed * 100, 0, 1000, tft.height(), 52);  // scale actual speed according to graph area on scale for plotting purposes
-    const auto yTargetPos = map(target_speed * 100, 0, 1000, tft.height(), 52);  // scale target speed according to graph area on scale for plotting purposes
-
-    // clear next line
-    tft.drawFastVLine(xPos_, 52, tft.height() - 52, ILI9341_BLACK);
-    tft.drawFastVLine(xPos_ + 1, 52, tft.height() - 52, ILI9341_BLACK);
-    tft.drawFastVLine(xPos_ + 2, 52, tft.height() - 52, ILI9341_BLACK);
-
-    // indicator for current position
-    tft.drawFastHLine(0, tft.height() - 2, tft.width(), ILI9341_BLACK);
-    tft.drawFastHLine(0, tft.height() - 1, tft.width(), ILI9341_BLACK);
-    tft.drawFastVLine( xPos_, tft.height() - 2, 2, ILI9341_GREEN );
-
-    // actual speed
-    tft.drawFastVLine( xPos_, yPos, 2, ILI9341_WHITE );
-
-    // target speed
-    tft.drawPixel( xPos_, yTargetPos, ILI9341_RED );
-
-    tft.setCursor(0, 35);
-    tft.print(speed, 2);
-    tft.print(" - ");
-    tft.print(target_speed, 2);
-    tft.print(" - ");
-    tft.print((long)tick_ms.count());
-  })
-  | unifex::on(scheduler);
+  tft.setCursor(0, 35);
+  tft.print(current_event.speed, 2);
+  tft.print(" - ");
+  tft.print(target_speed, 2);
+  tft.print(" - ");
+  using days_t = std::chrono::duration<std::intmax_t, std::ratio<86400>>;
+  const auto days = std::chrono::duration_cast<days_t>(tick_ms);
+  const auto hours = std::chrono::duration_cast<std::chrono::hours>(tick_ms) % std::chrono::hours(12);
+  const auto minutes = std::chrono::duration_cast<std::chrono::minutes>(tick_ms) % std::chrono::minutes(60);
+  const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(tick_ms) % std::chrono::seconds(60);
+  tft.print((long)days.count());
+  tft.print(":");
+  tft.print((long)hours.count());
+  tft.print(":");
+  tft.print((long)minutes.count());
+  tft.print(":");
+  tft.print((long)seconds.count());
 }
 
-auto runIrps() {
-    return irps_context.all_interrupts()
+void printEvent(double output_mm, unifex::timer_context::time_point now, const struct ir_event& current_event) {
+  const auto tick_ms = std::chrono::duration_cast<std::chrono::milliseconds>(current_event.eventTime.time_since_epoch());
+
+  using seconds_t = std::chrono::duration<float>;
+  Serial.print(std::chrono::time_point_cast<seconds_t>(now).time_since_epoch().count(), 2);
+  Serial.print("s - ");
+  Serial.print(std::chrono::time_point_cast<seconds_t>(current_event.eventTime).time_since_epoch().count(), 2);
+  Serial.print("s - ");
+  Serial.print(std::chrono::time_point_cast<seconds_t>(current_event.startTime).time_since_epoch().count(), 2);
+  Serial.print("s - ");
+  Serial.print(std::chrono::time_point_cast<seconds_t>(current_event.endTime).time_since_epoch().count(), 2);
+  Serial.print("s - ");
+  Serial.print((long)std::chrono::duration_cast<std::chrono::microseconds>(now - (current_event.endTime + std::chrono::microseconds(10))).count());
+  Serial.print("us, ");
+  Serial.print(current_event.irps_number);
+  Serial.print(", ");
+  Serial.print(output_mm);
+  Serial.println("mm");
+}
+
+template <typename Disambiguator>
+void queueEventOnLoop(const struct ir_event& current_event) {
+  unifex::static_submit(
+    unifex::schedule_at(unifex::get_scheduler(timer), current_event.endTime + std::chrono::microseconds(10)) 
+    | unifex::transform([current_event, dis = Disambiguator{}](){
+      unifex::static_submit(
+        unifex::schedule(unifex::get_scheduler(loop_context)) 
+        | unifex::transform([current_event, dis](){
+          const auto now = unifex::get_scheduler(timer).now();
+
+          if (current_event.irps_number == 2) {
+            drawEvent(now, current_event);
+          }
+
+          const double output_mm = updatePID(current_event);
+
+          printEvent(output_mm, now, current_event);
+        }));
+    }));
+
+
+//          unifex::static_submit(
+//            unifex::schedule(unifex::get_scheduler(loop_context)) 
+//            | unifex::transform([current_event](){
+//              const auto now = unifex::get_scheduler(timer).now();
+//              using seconds_t = std::chrono::duration<float>;
+//              Serial.print(std::chrono::time_point_cast<seconds_t>(now).time_since_epoch().count(), 2);
+//              Serial.print("s - ");
+//              Serial.print(std::chrono::time_point_cast<seconds_t>(current_event.eventTime).time_since_epoch().count(), 2);
+//              Serial.print("s - ");
+//              Serial.print(current_event.irps_number);
+//              Serial.print(", ");
+//              Serial.println(current_event.irps_status == IRPSStatus::Exited ? "Exited" : (current_event.irps_status == IRPSStatus::Entered) ? "Entered" : "Ready" );
+//              Serial.print(", ");
+//              Serial.println(current_event.print_string);
+//            }));
+}
+
+template<typename InterruptsSender>
+auto runIrps(InterruptsSender&& interruptsSender) {
+    return std::forward<InterruptsSender>(interruptsSender)
     | unifex::transform([](auto index){
-    //demultiplexes hardware ir_interrupt and calls relevant Speed Sensor (IRPS) based on address
-
-    irps_number = IRPS::readIrpsAddress();
-
-    if (irps_number < 0 || irps_number >= irpsCount) {
-      irps_number = 0;
-      return;
-    }
-
-    auto now = unifex::get_scheduler(timer).now();
-
-    struct ir_event current_event = irps[irps_number].handleStatus(irps_number, now);
-
-    // if a pulse is required, then send parameters to EM function
-    if (current_event.irps_status == IRPSStatus::Exited && current_event.startTime > now ) {
-      em[current_event.em_number].setup_timer(current_event);
-    }
-
-    // reset other irps
-    for (int i = 0; i < irpsCount; i++) {
-      if (i != irps_number) {
-        irps[i].reset();
+      //demultiplexes hardware ir_interrupt and calls relevant Speed Sensor (IRPS) based on address
+  
+      irps_number = IRPS::readIrpsAddress();
+  
+      if (irps_number < 0 || irps_number >= irpsCount) {
+        irps_number = 0;
+        return;
       }
-    }
-  });
+  
+      auto now = unifex::get_scheduler(timer).now();
+  
+      struct ir_event current_event = irps[irps_number].handleStatus(irps_number, now);
+
+      for (int irpIndex = 0; irpIndex < irpsCount; ++irpIndex) {
+        if (irpIndex != irps_number) {
+          irps[irpIndex].reset();
+        }
+      }
+  
+      if (irps_number != 0) {
+        if (current_event.irps_status == IRPSStatus::Exited && current_event.speed > 0.0f) {
+          // A pulse is required, send parameters to EM function
+          em[current_event.em_number].setup_timer(current_event);
+
+          if (irps_number == 1) {
+            struct irps_1{};
+            queueEventOnLoop<irps_1>(current_event);
+          }
+          else if (irps_number == 2) {
+            struct irps_2{};
+            queueEventOnLoop<irps_2>(current_event);
+          }
+          else if (irps_number == 3) {
+            struct irps_3{};
+            queueEventOnLoop<irps_3>(current_event);
+          }
+        }
+      }
+    });
 }
 
 void setup() {
@@ -720,6 +662,15 @@ void setup() {
   tft.setTextWrap(false);
   tft.setAddrWindow(0, 0, tft.width(), tft.height());
 
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+  tft.setTextSize(1);
+  tft.println("~ PPA! ~ particle_libunifex_v1_6EM");
+  tft.println("");
+  tft.print("Actual - Target (Speeds in m/sec)");
+  tft.setTextSize(2);
+
   irps_number = 0;
 
   // reset all irps
@@ -733,20 +684,16 @@ void setup() {
     em[i].reset();
   }
 
-  static_submit(runThrottle(unifex::get_scheduler(timer), thr));
+  unifex::static_submit(runThrottle(unifex::get_scheduler(timer), thr));
 
-  static_submit(runDisplay(unifex::get_scheduler(timer)));
-
-  static_submit(runPid(unifex::get_scheduler(timer)));
-
-  static_submit(runIrps());
+  unifex::static_submit(runIrps(irps_context.all_interrupts()));
 
   irps_context.attach(ir_interrupt, RISING);
 }
 
 //MAIN LOOP
 void loop() {
-  wdt_enable(WDTO_500MS);
+//  wdt_enable(WDTO_500MS);
 
   if (active_irps().get_irps_number() == 0 || active_irps().get_status() != IRPSStatus::Exited || active_em().get_status() != EMStatus::Off) {
     return;

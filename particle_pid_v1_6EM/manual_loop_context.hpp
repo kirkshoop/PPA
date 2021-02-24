@@ -15,12 +15,16 @@
  */
 #pragma once
 
+#include <cassert>
+#include <type_traits>
+
 #include <unifex/blocking.hpp>
 #include <unifex/get_stop_token.hpp>
 #include <unifex/receiver_concepts.hpp>
+#include <unifex/scheduler_concepts.hpp>
 #include <unifex/stop_token_concepts.hpp>
 
-#include <type_traits>
+#include "sequence.hpp"
 
 #include <unifex/detail/prologue.hpp>
 
@@ -46,12 +50,28 @@ struct task_base {
 template <typename Receiver>
 struct _op {
   class type;
+  class unwinder;
 };
 template <typename Receiver>
 using operation = typename _op<remove_cvref_t<Receiver>>::type;
 
+template<typename Receiver>
+struct _op<Receiver>::unwinder {
+  using op_t = typename _op<Receiver>::type;
+  op_t* op_;
+  Receiver& get_receiver() {
+    return op_->receiver_;
+  } 
+  template <typename Cpo, typename... Vn>
+  friend void tag_invoke(unifex::tag_t<unifex::unwind>, unwinder& self, Cpo cpo, Vn&&... vn) noexcept {
+    unifex::unwound(self.get_receiver(), cpo, (Vn&&) vn...);
+  }
+};
+
 template <typename Receiver>
 class _op<Receiver>::type final : task_base {
+  using unwinder_t = typename _op<Receiver>::unwinder;
+  friend class _op<Receiver>::unwinder;
   using stop_token_type = stop_token_type_t<Receiver&>;
 
  public:
@@ -60,6 +80,13 @@ class _op<Receiver>::type final : task_base {
     : task_base(&type::execute_impl)
     , receiver_((Receiver2 &&) receiver)
     , loop_(loop) {}
+
+  friend unwinder_t tag_invoke(unifex::tag_t<unifex::get_unwinder>, const type& self) noexcept {
+    return unwinder_t{const_cast<type*>(&self)};
+  }
+
+  friend void tag_invoke(unifex::tag_t<unifex::step>, type&) noexcept {
+  }
 
   void start() noexcept;
 
@@ -139,8 +166,12 @@ class context {
     context* loop_;
   };
 
-  scheduler get_scheduler() {
+  scheduler get_scheduler() const noexcept {
     return scheduler{this};
+  }
+
+  friend scheduler tag_invoke(tag_t<unifex::get_scheduler>, const context& self) noexcept {
+    return const_cast<context&>(self).get_scheduler();
   }
 
   void run_once();
